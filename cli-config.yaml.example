@@ -732,9 +732,10 @@ code_execution:
 # Subagent Delegation
 # =============================================================================
 # The delegate_task tool spawns child agents with isolated context.
-# Supports single tasks and batch mode (up to 3 parallel).
+# Supports single tasks and batch mode (up to 5 parallel, max 8).
 delegation:
   max_iterations: 50                          # Max tool-calling turns per child (default: 50)
+  # max_concurrent_children: 5                # Max parallel child agents (default: 5, cap: 8)
   default_toolsets: ["terminal", "file", "web"]  # Default toolsets for subagents
   # model: "google/gemini-3-flash-preview"    # Override model for subagents (empty = inherit parent)
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)

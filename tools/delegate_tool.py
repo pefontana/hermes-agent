@@ -50,13 +50,17 @@ _SUBAGENT_TOOLSETS = sorted(
 )
 _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
 
-_DEFAULT_MAX_CONCURRENT_CHILDREN = 3
+_DEFAULT_MAX_CONCURRENT_CHILDREN = 5
+_MAX_CONCURRENT_CHILDREN_CAP = 8
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 
 
 def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
-    DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (3).
+    DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (5).
+
+    Values above ``_MAX_CONCURRENT_CHILDREN_CAP`` (8) are clamped with a
+    warning log.  Aligned with OpenClaw's DEFAULT_SUBAGENT_MAX_CONCURRENT.
 
     Uses the same ``_load_config()`` path that the rest of ``delegate_task``
     uses, keeping config priority consistent (config.yaml > env > default).
@@ -65,18 +69,37 @@ def _get_max_concurrent_children() -> int:
     val = cfg.get("max_concurrent_children")
     if val is not None:
         try:
-            return max(1, int(val))
+            resolved = max(1, int(val))
         except (TypeError, ValueError):
             logger.warning(
                 "delegation.max_concurrent_children=%r is not a valid integer; "
                 "using default %d", val, _DEFAULT_MAX_CONCURRENT_CHILDREN,
             )
+            return _DEFAULT_MAX_CONCURRENT_CHILDREN
+        if resolved > _MAX_CONCURRENT_CHILDREN_CAP:
+            logger.warning(
+                "delegation.max_concurrent_children=%d exceeds cap of %d; "
+                "clamping to %d",
+                resolved, _MAX_CONCURRENT_CHILDREN_CAP,
+                _MAX_CONCURRENT_CHILDREN_CAP,
+            )
+            return _MAX_CONCURRENT_CHILDREN_CAP
+        return resolved
     env_val = os.getenv("DELEGATION_MAX_CONCURRENT_CHILDREN")
     if env_val:
         try:
-            return max(1, int(env_val))
+            resolved = max(1, int(env_val))
         except (TypeError, ValueError):
-            pass
+            return _DEFAULT_MAX_CONCURRENT_CHILDREN
+        if resolved > _MAX_CONCURRENT_CHILDREN_CAP:
+            logger.warning(
+                "DELEGATION_MAX_CONCURRENT_CHILDREN=%d exceeds cap of %d; "
+                "clamping to %d",
+                resolved, _MAX_CONCURRENT_CHILDREN_CAP,
+                _MAX_CONCURRENT_CHILDREN_CAP,
+            )
+            return _MAX_CONCURRENT_CHILDREN_CAP
+        return resolved
     return _DEFAULT_MAX_CONCURRENT_CHILDREN
 DEFAULT_MAX_ITERATIONS = 50
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
@@ -1082,7 +1105,7 @@ DELEGATE_TASK_SCHEMA = {
                 # delegation.max_concurrent_children (default 3) and
                 # enforced with a clear error in delegate_task().
                 "description": (
-                    "Batch mode: tasks to run in parallel (limit configurable via delegation.max_concurrent_children, default 3). Each gets "
+                    "Batch mode: tasks to run in parallel (limit configurable via delegation.max_concurrent_children, default 5, max 8). Each gets "
                     "its own subagent with isolated context and terminal session. "
                     "When provided, top-level goal/context/toolsets are ignored."
                 ),

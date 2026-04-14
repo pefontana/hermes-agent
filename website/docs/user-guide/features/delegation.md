@@ -20,7 +20,7 @@ delegate_task(
 
 ## Parallel Batch
 
-Up to 3 concurrent subagents:
+Up to 5 concurrent subagents (configurable, max 8):
 
 ```python
 delegate_task(tasks=[
@@ -121,8 +121,8 @@ delegate_task(
 
 When you provide a `tasks` array, subagents run in **parallel** using a thread pool:
 
-- **Maximum concurrency:** 3 tasks (the `tasks` array is truncated to 3 if longer)
-- **Thread pool:** Uses `ThreadPoolExecutor` with `MAX_CONCURRENT_CHILDREN = 3` workers
+- **Maximum concurrency:** 5 tasks by default (configurable via `delegation.max_concurrent_children`, absolute cap of 8)
+- **Thread pool:** Uses `ThreadPoolExecutor` with the configured concurrency limit as max workers
 - **Progress display:** In CLI mode, a tree-view shows tool calls from each subagent in real-time with per-task completion lines. In gateway mode, progress is batched and relayed to the parent's progress callback
 - **Result ordering:** Results are sorted by task index to match input order regardless of completion order
 - **Interrupt propagation:** Interrupting the parent (e.g., sending a new message) interrupts all active children
@@ -193,7 +193,7 @@ Delegation has a **depth limit of 2** — a parent (depth 0) can spawn children 
 | **Reasoning** | Full LLM reasoning loop | Just Python code execution |
 | **Context** | Fresh isolated conversation | No conversation, just script |
 | **Tool access** | All non-blocked tools with reasoning | 7 tools via RPC, no reasoning |
-| **Parallelism** | Up to 3 concurrent subagents | Single script |
+| **Parallelism** | Up to 5 concurrent subagents (max 8) | Single script |
 | **Best for** | Complex tasks needing judgment | Mechanical multi-step pipelines |
 | **Token cost** | Higher (full LLM loop) | Lower (only stdout returned) |
 | **User interaction** | None (subagents can't clarify) | None |
