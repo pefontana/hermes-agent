@@ -16,6 +16,7 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import enum
 import json
 import logging
 logger = logging.getLogger(__name__)
@@ -80,6 +81,38 @@ def _get_max_concurrent_children() -> int:
 DEFAULT_MAX_ITERATIONS = 50
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+
+
+# ---------------------------------------------------------------------------
+# Delegation progress event types
+# ---------------------------------------------------------------------------
+
+class DelegateEvent(str, enum.Enum):
+    """Formal event types emitted during delegation progress.
+
+    _build_child_progress_callback normalises incoming legacy strings
+    (``tool.started``, ``_thinking``, …) to these enum values via
+    ``_LEGACY_EVENT_MAP``.  External consumers (gateway SSE, ACP adapter,
+    CLI) still receive the legacy strings during the deprecation window.
+    """
+    TASK_SPAWNED = "delegate.task_spawned"
+    TASK_PROGRESS = "delegate.task_progress"
+    TASK_COMPLETED = "delegate.task_completed"
+    TASK_FAILED = "delegate.task_failed"
+    TASK_THINKING = "delegate.task_thinking"
+    TASK_TOOL_STARTED = "delegate.tool_started"
+    TASK_TOOL_COMPLETED = "delegate.tool_completed"
+
+
+# Legacy event strings → DelegateEvent mapping.
+# Incoming child-agent events use the old names; the callback normalises them.
+_LEGACY_EVENT_MAP: Dict[str, DelegateEvent] = {
+    "_thinking": DelegateEvent.TASK_THINKING,
+    "reasoning.available": DelegateEvent.TASK_THINKING,
+    "tool.started": DelegateEvent.TASK_TOOL_STARTED,
+    "tool.completed": DelegateEvent.TASK_TOOL_COMPLETED,
+    "subagent_progress": DelegateEvent.TASK_PROGRESS,
+}
 
 
 def check_delegate_requirements() -> bool:
@@ -179,11 +212,12 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
     _batch: List[str] = []
 
     def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
-        # event_type is one of: "tool.started", "tool.completed",
-        # "reasoning.available", "_thinking", "subagent_progress"
+        # Normalise legacy event strings to DelegateEvent enum.
+        event = _LEGACY_EVENT_MAP.get(event_type)
+        if event is None:
+            return  # Unknown event — ignore
 
-        # "_thinking" / reasoning events
-        if event_type in ("_thinking", "reasoning.available"):
+        if event == DelegateEvent.TASK_THINKING:
             text = preview or tool_name or ""
             if spinner:
                 short = (text[:55] + "...") if len(text) > 55 else text
@@ -194,11 +228,10 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
             # Don't relay thinking to gateway (too noisy for chat)
             return
 
-        # tool.completed — no display needed here (spinner shows on started)
-        if event_type == "tool.completed":
+        if event == DelegateEvent.TASK_TOOL_COMPLETED:
             return
 
-        # tool.started — display and batch for parent relay
+        # TASK_TOOL_STARTED — display and batch for parent relay
         if spinner:
             short = (preview[:35] + "...") if preview and len(preview) > 35 else (preview or "")
             from agent.display import get_tool_emoji
@@ -216,6 +249,7 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
             if len(_batch) >= _BATCH_SIZE:
                 summary = ", ".join(_batch)
                 try:
+                    # Back-compat: emit legacy "subagent_progress" name
                     parent_cb("subagent_progress", f"🔀 {prefix}{summary}")
                 except Exception as e:
                     logger.debug("Parent callback failed: %s", e)
