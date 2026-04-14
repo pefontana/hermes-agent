@@ -112,6 +112,9 @@ class DelegateEvent(str, enum.Enum):
     (``tool.started``, ``_thinking``, …) to these enum values via
     ``_LEGACY_EVENT_MAP``.  External consumers (gateway SSE, ACP adapter,
     CLI) still receive the legacy strings during the deprecation window.
+
+    TASK_SPAWNED / TASK_COMPLETED / TASK_FAILED are reserved for M3
+    (orchestrator role) and not yet emitted.
     """
     TASK_SPAWNED = "delegate.task_spawned"
     TASK_PROGRESS = "delegate.task_progress"

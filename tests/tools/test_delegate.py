@@ -1358,8 +1358,8 @@ class TestDelegateEventEnum(unittest.TestCase):
         for old_name, event in _LEGACY_EVENT_MAP.items():
             self.assertIsInstance(event, DelegateEvent)
 
-    def test_progress_callback_normalises_legacy_events(self):
-        """_build_child_progress_callback handles old string event names."""
+    def test_progress_callback_normalises_tool_started(self):
+        """_build_child_progress_callback handles tool.started via enum."""
         parent = _make_mock_parent()
         parent._delegate_spinner = MagicMock()
         parent.tool_progress_callback = MagicMock()
@@ -1367,9 +1367,33 @@ class TestDelegateEventEnum(unittest.TestCase):
         cb = _build_child_progress_callback(0, parent, task_count=1)
         self.assertIsNotNone(cb)
 
-        # tool.started should trigger spinner display
         cb("tool.started", tool_name="terminal", preview="ls")
         parent._delegate_spinner.print_above.assert_called()
+
+    def test_progress_callback_normalises_thinking(self):
+        """Both _thinking and reasoning.available route to TASK_THINKING."""
+        parent = _make_mock_parent()
+        parent._delegate_spinner = MagicMock()
+        parent.tool_progress_callback = None
+
+        cb = _build_child_progress_callback(0, parent, task_count=1)
+
+        cb("_thinking", tool_name=None, preview="pondering...")
+        assert any("💭" in str(c) for c in parent._delegate_spinner.print_above.call_args_list)
+
+        parent._delegate_spinner.print_above.reset_mock()
+        cb("reasoning.available", tool_name=None, preview="hmm")
+        assert any("💭" in str(c) for c in parent._delegate_spinner.print_above.call_args_list)
+
+    def test_progress_callback_tool_completed_is_noop(self):
+        """tool.completed is normalised but produces no display output."""
+        parent = _make_mock_parent()
+        parent._delegate_spinner = MagicMock()
+        parent.tool_progress_callback = None
+
+        cb = _build_child_progress_callback(0, parent, task_count=1)
+        cb("tool.completed", tool_name="terminal")
+        parent._delegate_spinner.print_above.assert_not_called()
 
     def test_progress_callback_ignores_unknown_events(self):
         """Unknown event types are silently ignored."""
