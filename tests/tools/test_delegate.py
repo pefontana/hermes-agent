@@ -1311,15 +1311,15 @@ class TestDispatchDelegateTask(unittest.TestCase):
             mock_child.model = "test"
             mock_build.return_value = mock_child
 
-            result = delegate_task(
+            delegate_task(
                 goal="test",
                 acp_command="claude",
                 acp_args=["--acp", "--stdio"],
                 parent_agent=parent,
             )
-            # _build_child_agent must have received the ACP overrides
-            call_kwargs = mock_build.call_args
-            self.assertEqual(call_kwargs[1].get("override_acp_command") or call_kwargs[0][11] if len(call_kwargs[0]) > 11 else call_kwargs[1].get("override_acp_command"), "claude")
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs["override_acp_command"], "claude")
+            self.assertEqual(kwargs["override_acp_args"], ["--acp", "--stdio"])
 
     @patch("tools.delegate_tool._load_config", return_value={})
     @patch("tools.delegate_tool._resolve_delegation_credentials")
