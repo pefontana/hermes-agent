@@ -6888,8 +6888,28 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
+    def _dispatch_delegate_task(self, function_args: dict, messages: list = None) -> str:
+        """Forward delegate_task with the full schema to avoid param drift.
+
+        Every parameter in DELEGATE_TASK_SCHEMA is forwarded from function_args
+        so that new schema fields (acp_command, acp_args, and any future
+        additions) are never silently dropped by a stale call site.
+        """
+        from tools.delegate_tool import delegate_task as _delegate_task
+        return _delegate_task(
+            goal=function_args.get("goal"),
+            context=function_args.get("context"),
+            toolsets=function_args.get("toolsets"),
+            tasks=function_args.get("tasks"),
+            max_iterations=function_args.get("max_iterations"),
+            acp_command=function_args.get("acp_command"),
+            acp_args=function_args.get("acp_args"),
+            parent_agent=self,
+            messages=messages,
+        )
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
-                     tool_call_id: Optional[str] = None) -> str:
+                     tool_call_id: Optional[str] = None, messages: list = None) -> str:
         """Invoke a single tool and return the result string. No display logic.
 
         Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
@@ -6957,15 +6977,7 @@ class AIAgent:
                 callback=self.clarify_callback,
             )
         elif function_name == "delegate_task":
-            from tools.delegate_tool import delegate_task as _delegate_task
-            return _delegate_task(
-                goal=function_args.get("goal"),
-                context=function_args.get("context"),
-                toolsets=function_args.get("toolsets"),
-                tasks=function_args.get("tasks"),
-                max_iterations=function_args.get("max_iterations"),
-                parent_agent=self,
-            )
+            return self._dispatch_delegate_task(function_args, messages)
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -7073,7 +7085,7 @@ class AIAgent:
             """Worker function executed in a thread."""
             start = time.time()
             try:
-                result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id)
+                result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id, messages=messages)
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -7347,7 +7359,6 @@ class AIAgent:
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
             elif function_name == "delegate_task":
-                from tools.delegate_tool import delegate_task as _delegate_task
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):
                     spinner_label = f"🔀 delegating {len(tasks_arg)} tasks"
@@ -7362,14 +7373,7 @@ class AIAgent:
                 self._delegate_spinner = spinner
                 _delegate_result = None
                 try:
-                    function_result = _delegate_task(
-                        goal=function_args.get("goal"),
-                        context=function_args.get("context"),
-                        toolsets=function_args.get("toolsets"),
-                        tasks=tasks_arg,
-                        max_iterations=function_args.get("max_iterations"),
-                        parent_agent=self,
-                    )
+                    function_result = self._dispatch_delegate_task(function_args, messages)
                     _delegate_result = function_result
                 finally:
                     self._delegate_spinner = None
