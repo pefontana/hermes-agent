@@ -216,7 +216,7 @@ Restricting toolsets keeps the subagent focused and prevents accidental side eff
 
 ## Constraints
 
-- **Default 3 parallel tasks** — batches default to 3 concurrent subagents (configurable via `delegation.max_concurrent_children` in config.yaml)
+- **Default 5 parallel tasks (max 8)** — batches default to 5 concurrent subagents (configurable via `delegation.max_concurrent_children` in config.yaml, capped at 8)
 - **No nesting** — subagents cannot call `delegate_task`, `clarify`, `memory`, `send_message`, or `execute_code`
 - **Separate terminals** — each subagent gets its own terminal session with separate working directory and state
 - **No conversation history** — subagents see only what you put in `goal` and `context`

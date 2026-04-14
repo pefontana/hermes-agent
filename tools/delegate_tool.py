@@ -1026,7 +1026,7 @@ DELEGATE_TASK_SCHEMA = {
         "never enter your context window.\n\n"
         "TWO MODES (one of 'goal' or 'tasks' is required):\n"
         "1. Single task: provide 'goal' (+ optional context, toolsets)\n"
-        "2. Batch (parallel): provide 'tasks' array with up to 3 items. "
+        "2. Batch (parallel): provide 'tasks' array with up to 5 items (max 8). "
         "All run concurrently and results are returned together.\n\n"
         "WHEN TO USE delegate_task:\n"
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
