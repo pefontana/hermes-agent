@@ -20,11 +20,15 @@ from unittest.mock import MagicMock, patch
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
+    DelegateEvent,
     _get_max_concurrent_children,
+    _LEGACY_EVENT_MAP,
+    _MAX_CONCURRENT_CHILDREN_CAP,
     MAX_DEPTH,
     check_delegate_requirements,
     delegate_task,
     _build_child_agent,
+    _build_child_progress_callback,
     _build_child_system_prompt,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
@@ -565,7 +569,7 @@ class TestBlockedTools(unittest.TestCase):
             self.assertIn(tool, DELEGATE_BLOCKED_TOOLS)
 
     def test_constants(self):
-        self.assertEqual(_get_max_concurrent_children(), 3)
+        self.assertEqual(_get_max_concurrent_children(), 5)
         self.assertEqual(MAX_DEPTH, 2)
 
 
@@ -1276,6 +1280,140 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         )
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
+
+
+# =========================================================================
+# M0 — Dispatch helper, progress events, concurrency
+# =========================================================================
+
+class TestDispatchDelegateTask(unittest.TestCase):
+    """Tests for the _dispatch_delegate_task helper and full param forwarding."""
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_acp_args_forwarded(self, mock_creds, mock_cfg):
+        """Both acp_command and acp_args reach delegate_task via the helper."""
+        mock_creds.return_value = {
+            "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None, "model": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool._build_child_agent") as mock_build:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True,
+                "api_calls": 1, "messages": [],
+            }
+            mock_child._delegate_saved_tool_names = []
+            mock_child._credential_pool = None
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.model = "test"
+            mock_build.return_value = mock_child
+
+            result = delegate_task(
+                goal="test",
+                acp_command="claude",
+                acp_args=["--acp", "--stdio"],
+                parent_agent=parent,
+            )
+            # _build_child_agent must have received the ACP overrides
+            call_kwargs = mock_build.call_args
+            self.assertEqual(call_kwargs[1].get("override_acp_command") or call_kwargs[0][11] if len(call_kwargs[0]) > 11 else call_kwargs[1].get("override_acp_command"), "claude")
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_dispatch_helper_passes_messages(self, mock_creds, mock_cfg):
+        """_dispatch_delegate_task threads messages to delegate_task."""
+        mock_creds.return_value = {
+            "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None, "model": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        messages = [{"role": "user", "content": "hello"}]
+
+        with patch("tools.delegate_tool.delegate_task") as mock_dt:
+            mock_dt.return_value = "{}"
+            from run_agent import AIAgent
+            # Call through the dispatch helper
+            AIAgent._dispatch_delegate_task(parent, {"goal": "test"}, messages)
+            call_kwargs = mock_dt.call_args
+            self.assertIs(call_kwargs[1]["messages"], messages)
+
+
+class TestDelegateEventEnum(unittest.TestCase):
+    """Tests for DelegateEvent enum and back-compat aliases."""
+
+    def test_enum_values_are_strings(self):
+        for event in DelegateEvent:
+            self.assertIsInstance(event.value, str)
+            self.assertTrue(event.value.startswith("delegate."))
+
+    def test_legacy_map_covers_all_old_names(self):
+        expected_legacy = {"_thinking", "reasoning.available",
+                          "tool.started", "tool.completed", "subagent_progress"}
+        self.assertEqual(set(_LEGACY_EVENT_MAP.keys()), expected_legacy)
+
+    def test_legacy_map_values_are_delegate_events(self):
+        for old_name, event in _LEGACY_EVENT_MAP.items():
+            self.assertIsInstance(event, DelegateEvent)
+
+    def test_progress_callback_normalises_legacy_events(self):
+        """_build_child_progress_callback handles old string event names."""
+        parent = _make_mock_parent()
+        parent._delegate_spinner = MagicMock()
+        parent.tool_progress_callback = MagicMock()
+
+        cb = _build_child_progress_callback(0, parent, task_count=1)
+        self.assertIsNotNone(cb)
+
+        # tool.started should trigger spinner display
+        cb("tool.started", tool_name="terminal", preview="ls")
+        parent._delegate_spinner.print_above.assert_called()
+
+    def test_progress_callback_ignores_unknown_events(self):
+        """Unknown event types are silently ignored."""
+        parent = _make_mock_parent()
+        parent._delegate_spinner = MagicMock()
+
+        cb = _build_child_progress_callback(0, parent, task_count=1)
+        # Should not raise
+        cb("some.unknown.event", tool_name="x")
+        parent._delegate_spinner.print_above.assert_not_called()
+
+
+class TestConcurrencyDefaults(unittest.TestCase):
+    """Tests for the new concurrency default and cap."""
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_default_is_five(self, mock_cfg):
+        # Clear env var if set
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_get_max_concurrent_children(), 5)
+
+    @patch("tools.delegate_tool._load_config",
+           return_value={"max_concurrent_children": 10})
+    def test_caps_at_eight(self, mock_cfg):
+        self.assertEqual(_get_max_concurrent_children(), _MAX_CONCURRENT_CHILDREN_CAP)
+
+    @patch("tools.delegate_tool._load_config",
+           return_value={"max_concurrent_children": 10})
+    def test_cap_logs_warning(self, mock_cfg):
+        import logging
+        with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
+            result = _get_max_concurrent_children()
+        self.assertEqual(result, 8)
+        self.assertTrue(any("exceeds cap" in msg for msg in cm.output))
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_env_var_also_caps(self, mock_cfg):
+        with patch.dict(os.environ, {"DELEGATION_MAX_CONCURRENT_CHILDREN": "12"}):
+            self.assertEqual(_get_max_concurrent_children(), 8)
+
+    @patch("tools.delegate_tool._load_config",
+           return_value={"max_concurrent_children": 6})
+    def test_within_cap_returns_configured(self, mock_cfg):
+        self.assertEqual(_get_max_concurrent_children(), 6)
 
 
 if __name__ == "__main__":
