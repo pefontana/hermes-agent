@@ -173,16 +173,32 @@ delegate_task(
 )
 ```
 
-## Depth Limit
+## Depth Limit and Nested Orchestration
 
-Delegation has a **depth limit of 2** — a parent (depth 0) can spawn children (depth 1), but children cannot delegate further. This prevents runaway recursive delegation chains.
+By default, delegation is **flat**: a parent (depth 0) spawns children (depth 1), and those children cannot delegate further. This prevents runaway recursive delegation.
+
+For multi-stage workflows (research → synthesis, or parallel orchestration over sub-problems), a parent can spawn **orchestrator** children that *can* delegate their own workers:
+
+```python
+delegate_task(
+    goal="Survey three code review approaches and recommend one",
+    role="orchestrator",  # Allows this child to spawn its own workers
+    context="...",
+)
+```
+
+- `role="leaf"` (default): child cannot delegate further — identical to pre-M3 behavior.
+- `role="orchestrator"`: child retains the `delegation` toolset. Bounded by `delegation.max_spawn_depth` (default 2 → two levels of delegation; raise to 3 for three levels).
+- `delegation.orchestrator_enabled: false`: global kill switch that forces every child to `leaf` regardless of the `role` parameter.
+
+**Cost warning:** With `max_spawn_depth: 3` and `max_concurrent_children: 5`, the tree can reach 5×5×5 = 125 concurrent leaf agents. Keep `max_spawn_depth` tight unless you genuinely need depth-3 nesting.
 
 ## Key Properties
 
 - Each subagent gets its **own terminal session** (separate from the parent)
-- **No nested delegation** — children cannot delegate further (no grandchildren)
-- Subagents **cannot** call: `delegate_task`, `clarify`, `memory`, `send_message`, `execute_code`
-- **Interrupt propagation** — interrupting the parent interrupts all active children
+- **Nested delegation is opt-in** — only `role="orchestrator"` children can delegate further, bounded by `max_spawn_depth` (default 2; disable globally with `orchestrator_enabled: false`)
+- Leaf subagents **cannot** call: `delegate_task`, `clarify`, `memory`, `send_message`, `execute_code`. Orchestrator subagents retain `delegate_task` but still cannot use the other four.
+- **Interrupt propagation** — interrupting the parent interrupts all active children (including grandchildren under orchestrators)
 - Only the final summary enters the parent's context, keeping token usage efficient
 - Subagents inherit the parent's **API key, provider configuration, and credential pool** (enabling key rotation on rate limits)
 
@@ -206,6 +222,8 @@ Delegation has a **depth limit of 2** — a parent (depth 0) can spawn children 
 # In ~/.hermes/config.yaml
 delegation:
   max_iterations: 50                        # Max turns per child (default: 50)
+  # max_spawn_depth: 2                      # Tree depth (1-3, default 2). 2 = orchestrators can spawn leaves.
+  # orchestrator_enabled: true              # Disable to force all children to leaf role.
   model: "google/gemini-3-flash-preview"             # Optional provider/model override
   provider: "openrouter"                             # Optional built-in provider
 
