@@ -10,7 +10,7 @@ import inspect
 
 def test_delegation_default_toolsets_removed_from_cli_config():
     """delegation.default_toolsets was dead config — never read by
-    _load_config() or anywhere else. Removed in M0.5.
+    _load_config() or anywhere else. Removed.
 
     Guards against accidental re-introduction in cli.py's CLI_CONFIG default
     dict. If this test fails, someone re-added the key without wiring it up
@@ -29,8 +29,8 @@ def test_delegation_default_toolsets_removed_from_cli_config():
 
     source = inspect.getsource(load_cli_config)
     assert '"default_toolsets"' not in source, (
-        "delegation.default_toolsets was removed in M0.5 because it was "
-        "never read. Do not re-add it to cli.py's CLI_CONFIG default dict; "
-        "use tools/delegate_tool.py's DEFAULT_TOOLSETS module constant or "
+        "delegation.default_toolsets was removed because it was never read. "
+        "Do not re-add it to cli.py's CLI_CONFIG default dict; use "
+        "tools/delegate_tool.py's DEFAULT_TOOLSETS module constant or "
         "wire a new config key through _load_config()."
     )

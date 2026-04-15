@@ -42,7 +42,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset([
 # Excludes toolsets where ALL tools are blocked, composite/platform toolsets
 # (hermes-* prefixed), and scenario toolsets.
 #
-# M3 NOTE: "delegation" is in this exclusion set so the subagent-facing
+# NOTE: "delegation" is in this exclusion set so the subagent-facing
 # capability hint string (_TOOLSET_LIST_STR) doesn't advertise it as a
 # toolset to request explicitly — the correct mechanism for nested
 # delegation is role='orchestrator', which re-adds "delegation" in
@@ -59,7 +59,7 @@ _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 5
 _MAX_CONCURRENT_CHILDREN_CAP = 8
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
-# M3: configurable depth cap consulted by _get_max_spawn_depth; MAX_DEPTH
+# Configurable depth cap consulted by _get_max_spawn_depth; MAX_DEPTH
 # stays as the default fallback and is still the symbol tests import.
 _MIN_SPAWN_DEPTH = 1
 _MAX_SPAWN_DEPTH_CAP = 3
@@ -83,8 +83,8 @@ def _normalize_role(r: Optional[str]) -> str:
 
     None/empty -> 'leaf'.  Unknown strings coerce to 'leaf' with a
     warning log (matches the silent-degrade pattern of
-    _get_orchestrator_enabled).  M3 commit 3 adds a second degrade
-    layer in _build_child_agent for depth/kill-switch bounds.
+    _get_orchestrator_enabled).  _build_child_agent adds a second
+    degrade layer for depth/kill-switch bounds.
     """
     if r is None or not r:
         return "leaf"
@@ -130,12 +130,12 @@ def _get_max_spawn_depth() -> int:
 
     depth 0 = parent agent.  max_spawn_depth = N means agents at depths
     0..N-1 can spawn; depth N is the leaf floor.  Default 2 preserves
-    the legacy MAX_DEPTH = 2 behavior: parent spawns children (depth 1),
+    the original MAX_DEPTH = 2 behavior: parent spawns children (depth 1),
     depth-1 children cannot spawn (blocked by this guard AND, for leaf
     children, by the delegation toolset strip in _strip_blocked_tools).
 
-    With M3, role="orchestrator" removes the toolset strip for depth-1
-    children when max_spawn_depth >= 2, enabling nested orchestration.
+    role="orchestrator" removes the toolset strip for depth-1 children
+    when max_spawn_depth >= 2, enabling nested orchestration.
     """
     cfg = _load_config()
     val = cfg.get("max_spawn_depth")
@@ -160,7 +160,7 @@ def _get_max_spawn_depth() -> int:
 
 
 def _get_orchestrator_enabled() -> bool:
-    """Global kill switch for the M3 orchestrator role.
+    """Global kill switch for the orchestrator role.
 
     When False, role="orchestrator" is silently forced to "leaf" in
     _build_child_agent and the delegation toolset is stripped as before.
@@ -193,8 +193,8 @@ class DelegateEvent(str, enum.Enum):
     ``_LEGACY_EVENT_MAP``.  External consumers (gateway SSE, ACP adapter,
     CLI) still receive the legacy strings during the deprecation window.
 
-    TASK_SPAWNED / TASK_COMPLETED / TASK_FAILED are reserved for M3
-    (orchestrator role) and not yet emitted.
+    TASK_SPAWNED / TASK_COMPLETED / TASK_FAILED are reserved for
+    future orchestrator lifecycle events and are not currently emitted.
     """
     TASK_SPAWNED = "delegate.task_spawned"
     TASK_PROGRESS = "delegate.task_progress"
@@ -232,7 +232,7 @@ def _build_child_system_prompt(
 ) -> str:
     """Build a focused system prompt for a child agent.
 
-    M3: when role='orchestrator', appends a delegation-capability block
+    When role='orchestrator', appends a delegation-capability block
     modeled on OpenClaw's buildSubagentSystemPrompt (canSpawn branch at
     inspiration/openclaw/src/agents/subagent-system-prompt.ts:63-95).
     The depth note is literal truth (grounded in the passed config) so
@@ -355,9 +355,9 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
 
     def _callback(event_type, tool_name: str = None, preview: str = None, args=None, **kwargs):
         # Normalise legacy strings, new-style "delegate.*" strings, and
-        # DelegateEvent enum values all to a single DelegateEvent.  Before
-        # M3 this only accepted the five legacy strings; enum-typed callers
-        # were silently dropped.
+        # DelegateEvent enum values all to a single DelegateEvent.  The
+        # original implementation only accepted the five legacy strings;
+        # enum-typed callers were silently dropped.
         if isinstance(event_type, DelegateEvent):
             event = event_type
         else:
@@ -457,8 +457,9 @@ def _build_child_agent(
     # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
-    # M3: per-call role.  Commit 2 only stashes it on the child; commit 3
-    # adds the depth/kill-switch degrade and toolset re-add logic.
+    # Per-call role controlling whether the child can further delegate.
+    # 'leaf' (default) cannot; 'orchestrator' retains the delegation
+    # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
 ):
     """
@@ -472,7 +473,7 @@ def _build_child_agent(
     """
     from run_agent import AIAgent
 
-    # ── M3 role resolution ──────────────────────────────────────────────
+    # ── Role resolution ─────────────────────────────────────────────────
     # Honor the caller's role only when BOTH the kill switch and the
     # child's depth allow it.  This is the single point where role
     # degrades to 'leaf' — keeps the rule predictable.  Callers pass
@@ -510,7 +511,7 @@ def _build_child_agent(
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
-    # M3: Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
+    # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
     # removed.  The re-add is unconditional on parent-toolset membership because
     # orchestrator capability is granted by role, not inherited — see the
     # test_intersection_preserves_delegation_bound test for the design rationale.
@@ -611,7 +612,7 @@ def _build_child_agent(
     child._print_fn = getattr(parent_agent, '_print_fn', None)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
-    # M3: stash the post-degrade role for introspection (leaf if the
+    # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
 
@@ -874,9 +875,9 @@ def delegate_task(
       - Single: provide goal (+ optional context, toolsets, role)
       - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
 
-    The 'role' parameter (M3) controls whether a child can further
-    delegate: 'leaf' (default) cannot; 'orchestrator' retains the
-    delegation toolset and can spawn its own workers, bounded by
+    The 'role' parameter controls whether a child can further delegate:
+    'leaf' (default) cannot; 'orchestrator' retains the delegation
+    toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
 
     Returns JSON with results array, one entry per task.
@@ -887,8 +888,8 @@ def delegate_task(
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
 
-    # Depth limit (M3: configurable via delegation.max_spawn_depth,
-    # default 2 for parity with the legacy MAX_DEPTH constant).
+    # Depth limit — configurable via delegation.max_spawn_depth,
+    # default 2 for parity with the original MAX_DEPTH constant.
     depth = getattr(parent_agent, '_delegate_depth', 0)
     max_spawn = _get_max_spawn_depth()
     if depth >= max_spawn:
@@ -1375,7 +1376,7 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
-        role=args.get("role"),  # M3
+        role=args.get("role"),
         parent_agent=kw.get("parent_agent")),
     check_fn=check_delegate_requirements,
     emoji="🔀",

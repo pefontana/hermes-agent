@@ -187,7 +187,7 @@ delegate_task(
 )
 ```
 
-- `role="leaf"` (default): child cannot delegate further — identical to pre-M3 behavior.
+- `role="leaf"` (default): child cannot delegate further — identical to the flat-delegation behavior.
 - `role="orchestrator"`: child retains the `delegation` toolset. Bounded by `delegation.max_spawn_depth` (default 2 → two levels of delegation; raise to 3 for three levels).
 - `delegation.orchestrator_enabled: false`: global kill switch that forces every child to `leaf` regardless of the `role` parameter.
 

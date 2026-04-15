@@ -608,7 +608,7 @@ DEFAULT_CONFIG = {
                                # independent of the parent's max_iterations)
         "reasoning_effort": "",  # reasoning effort for subagents: "xhigh", "high", "medium",
                                  # "low", "minimal", "none" (empty = inherit parent's level)
-        # M3 — orchestrator role (see tools/delegate_tool.py:_get_max_spawn_depth
+        # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Values are clamped to [1, 3] with a
         # warning log if out of range.
         "max_spawn_depth": 2,        # depth cap (1 = flat, 2 = orchestrator→leaf, 3 = three-level)

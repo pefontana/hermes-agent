@@ -575,8 +575,8 @@ class TestBlockedTools(unittest.TestCase):
         )
         self.assertEqual(_get_max_concurrent_children(), 5)
         self.assertEqual(MAX_DEPTH, 2)
-        self.assertEqual(_get_max_spawn_depth(), 2)       # M3 default
-        self.assertTrue(_get_orchestrator_enabled())      # M3 default
+        self.assertEqual(_get_max_spawn_depth(), 2)       # default
+        self.assertTrue(_get_orchestrator_enabled())      # default
         self.assertEqual(_MIN_SPAWN_DEPTH, 1)
         self.assertEqual(_MAX_SPAWN_DEPTH_CAP, 3)
 
@@ -1291,7 +1291,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 
 
 # =========================================================================
-# M0 — Dispatch helper, progress events, concurrency
+# Dispatch helper, progress events, concurrency
 # =========================================================================
 
 class TestDispatchDelegateTask(unittest.TestCase):
@@ -1431,8 +1431,9 @@ class TestDelegateEventEnum(unittest.TestCase):
         render (no tool-start emoji lookup) and pass-through relay
         upward (no re-batching).
 
-        Regression reachable in M3 only: nested orchestrators relay
-        subagent_progress from grandchildren upward through this path.
+        Regression path only reachable once nested orchestration is
+        enabled: nested orchestrators relay subagent_progress from
+        grandchildren upward through this callback.
         """
         parent = _make_mock_parent()
         parent._delegate_spinner = MagicMock()
@@ -1486,7 +1487,7 @@ class TestConcurrencyDefaults(unittest.TestCase):
 
 
 # =========================================================================
-# M3 — max_spawn_depth clamping (Commit 1)
+# max_spawn_depth clamping
 # =========================================================================
 
 class TestMaxSpawnDepth(unittest.TestCase):
@@ -1525,13 +1526,13 @@ class TestMaxSpawnDepth(unittest.TestCase):
 
 
 # =========================================================================
-# M3 — role param plumbing (Commit 2)
+# role param plumbing
 # =========================================================================
 #
-# These tests cover the schema + signature + stash plumbing added in
-# Commit 2.  Full role-honoring behavior (toolset re-add, role-aware
-# prompt) lands in Commit 3 under the same test class, which is why the
-# tests here only assert on _delegate_role and on the schema shape.
+# These tests cover the schema + signature + stash plumbing of the role
+# param.  The full role-honoring behavior (toolset re-add, role-aware
+# prompt) lives in TestOrchestratorRoleBehavior below; these tests only
+# assert on _delegate_role stashing and on the schema shape.
 
 
 class TestOrchestratorRoleSchema(unittest.TestCase):
@@ -1597,7 +1598,7 @@ _SENTINEL = object()
 
 
 # =========================================================================
-# M3 — role-honoring behavior (Commit 3)
+# role-honoring behavior
 # =========================================================================
 
 
@@ -1787,21 +1788,19 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
 
 
 class TestOrchestratorEndToEnd(unittest.TestCase):
-    """M3 e2e: parent -> orchestrator -> leaf-leaf nested orchestration.
+    """End-to-end: parent -> orchestrator -> two-leaf nested orchestration.
 
-    Satisfies parent plan §7 item 3 acceptance: "End-to-end test passes
-    with mock provider: parent delegates to orchestrator child,
-    orchestrator delegates to two leaf grandchildren, results bubble up
-    correctly."
+    Covers the acceptance gate: parent delegates to an orchestrator
+    child; the orchestrator delegates to two leaf grandchildren; the
+    role/toolset/depth chain all resolve correctly.
 
-    Mock strategy (per plan §3.6 G3 sketch): a single AIAgent patch
-    with a side_effect factory that keys on the child's
-    ephemeral_system_prompt — orchestrator prompts contain the string
-    "Orchestrator Role" (see _build_child_system_prompt), leaves don't.
-    The orchestrator mock's run_conversation recursively calls
-    delegate_task with tasks=[{goal:...},{goal:...}] to spawn two
-    leaves.  This keeps the test in one patch context and avoids
-    depth-indexed nesting.
+    Mock strategy: a single AIAgent patch with a side_effect factory
+    that keys on the child's ephemeral_system_prompt — orchestrator
+    prompts contain the string "Orchestrator Role" (see
+    _build_child_system_prompt), leaves don't.  The orchestrator
+    mock's run_conversation recursively calls delegate_task with
+    tasks=[{goal:...},{goal:...}] to spawn two leaves.  This keeps
+    the test in one patch context and avoids depth-indexed nesting.
     """
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
