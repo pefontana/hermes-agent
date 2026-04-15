@@ -41,6 +41,12 @@ DELEGATE_BLOCKED_TOOLS = frozenset([
 # Build a description fragment listing toolsets available for subagents.
 # Excludes toolsets where ALL tools are blocked, composite/platform toolsets
 # (hermes-* prefixed), and scenario toolsets.
+#
+# M3 NOTE: "delegation" is in this exclusion set so the subagent-facing
+# capability hint string (_TOOLSET_LIST_STR) doesn't advertise it as a
+# toolset to request explicitly — the correct mechanism for nested
+# delegation is role='orchestrator', which re-adds "delegation" in
+# _build_child_agent regardless of this exclusion.
 _EXCLUDED_TOOLSET_NAMES = frozenset({"debugging", "safe", "delegation", "moa", "rl"})
 _SUBAGENT_TOOLSETS = sorted(
     name for name, defn in TOOLSETS.items()
@@ -220,8 +226,18 @@ def _build_child_system_prompt(
     context: Optional[str] = None,
     *,
     workspace_path: Optional[str] = None,
+    role: str = "leaf",
+    max_spawn_depth: int = 2,
+    child_depth: int = 1,
 ) -> str:
-    """Build a focused system prompt for a child agent."""
+    """Build a focused system prompt for a child agent.
+
+    M3: when role='orchestrator', appends a delegation-capability block
+    modeled on OpenClaw's buildSubagentSystemPrompt (canSpawn branch at
+    inspiration/openclaw/src/agents/subagent-system-prompt.ts:63-95).
+    The depth note is literal truth (grounded in the passed config) so
+    the LLM doesn't confabulate nesting capabilities that don't exist.
+    """
     parts = [
         "You are a focused subagent working on a specific delegated task.",
         "",
@@ -247,6 +263,37 @@ def _build_child_system_prompt(
         "Be thorough but concise -- your response is returned to the "
         "parent agent as a summary."
     )
+    if role == "orchestrator":
+        child_note = (
+            "Your own children MUST be leaves (cannot delegate further) "
+            "because they would be at the depth floor — you cannot pass "
+            "role='orchestrator' to your own delegate_task calls."
+            if child_depth + 1 >= max_spawn_depth else
+            "Your own children can themselves be orchestrators or leaves, "
+            "depending on the `role` you pass to delegate_task. Default is "
+            "'leaf'; pass role='orchestrator' explicitly when a child "
+            "needs to further decompose its work."
+        )
+        parts.append(
+            "\n## Subagent Spawning (Orchestrator Role)\n"
+            "You have access to the `delegate_task` tool and CAN spawn "
+            "your own subagents to parallelize independent work.\n\n"
+            "WHEN to delegate:\n"
+            "- The goal decomposes into 2+ independent subtasks that can "
+            "run in parallel (e.g. research A and B simultaneously).\n"
+            "- A subtask is reasoning-heavy and would flood your context "
+            "with intermediate data.\n\n"
+            "WHEN NOT to delegate:\n"
+            "- Single-step mechanical work — do it directly.\n"
+            "- Trivial tasks you can execute in one or two tool calls.\n"
+            "- Re-delegating your entire assigned goal to one worker "
+            "(that's just pass-through with no value added).\n\n"
+            "Coordinate your workers' results and synthesize them before "
+            "reporting back to your parent. You are responsible for the "
+            "final summary, not your workers.\n\n"
+            f"NOTE: You are at depth {child_depth}. The delegation tree "
+            f"is capped at max_spawn_depth={max_spawn_depth}. {child_note}"
+        )
     return "\n".join(parts)
 
 
@@ -395,6 +442,17 @@ def _build_child_agent(
     """
     from run_agent import AIAgent
 
+    # ── M3 role resolution ──────────────────────────────────────────────
+    # Honor the caller's role only when BOTH the kill switch and the
+    # child's depth allow it.  This is the single point where role
+    # degrades to 'leaf' — keeps the rule predictable.  Callers pass
+    # the normalised role (_normalize_role ran in delegate_task) so
+    # we only deal with 'leaf' or 'orchestrator' here.
+    child_depth = getattr(parent_agent, '_delegate_depth', 0) + 1
+    max_spawn = _get_max_spawn_depth()
+    orchestrator_ok = _get_orchestrator_enabled() and child_depth < max_spawn
+    effective_role = role if (role == "orchestrator" and orchestrator_ok) else "leaf"
+
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
     # Note: enabled_toolsets=None means "all tools enabled" (the default),
@@ -422,8 +480,21 @@ def _build_child_agent(
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
+    # M3: Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
+    # removed.  The re-add is unconditional on parent-toolset membership because
+    # orchestrator capability is granted by role, not inherited — see the
+    # test_intersection_preserves_delegation_bound test for the design rationale.
+    if effective_role == "orchestrator" and "delegation" not in child_toolsets:
+        child_toolsets.append("delegation")
+
     workspace_hint = _resolve_workspace_hint(parent_agent)
-    child_prompt = _build_child_system_prompt(goal, context, workspace_path=workspace_hint)
+    child_prompt = _build_child_system_prompt(
+        goal, context,
+        workspace_path=workspace_hint,
+        role=effective_role,
+        max_spawn_depth=max_spawn,
+        child_depth=child_depth,
+    )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -509,11 +580,10 @@ def _build_child_agent(
     )
     child._print_fn = getattr(parent_agent, '_print_fn', None)
     # Set delegation depth so children can't spawn grandchildren
-    child._delegate_depth = getattr(parent_agent, '_delegate_depth', 0) + 1
-    # M3: stash the normalised role for introspection.  Commit 3 will
-    # replace this with effective_role (after degrade) and use it to
-    # drive toolset re-add + role-aware prompt selection.
-    child._delegate_role = role
+    child._delegate_depth = child_depth
+    # M3: stash the post-degrade role for introspection (leaf if the
+    # kill switch or depth bounded the caller's requested role).
+    child._delegate_role = effective_role
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.

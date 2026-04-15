@@ -1531,5 +1531,195 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
 _SENTINEL = object()
 
 
+# =========================================================================
+# M3 — role-honoring behavior (Commit 3)
+# =========================================================================
+
+
+def _make_role_mock_child():
+    """Helper: mock child with minimal fields for delegate_task to process."""
+    mock_child = MagicMock()
+    mock_child.run_conversation.return_value = {
+        "final_response": "done", "completed": True,
+        "api_calls": 1, "messages": [],
+    }
+    mock_child._delegate_saved_tool_names = []
+    mock_child._credential_pool = None
+    mock_child.session_prompt_tokens = 0
+    mock_child.session_completion_tokens = 0
+    mock_child.model = "test"
+    return mock_child
+
+
+class TestOrchestratorRoleBehavior(unittest.TestCase):
+    """Tests that role='orchestrator' actually changes toolset + prompt."""
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_orchestrator_role_keeps_delegation_at_depth_1(
+        self, mock_cfg, mock_creds
+    ):
+        """role='orchestrator' + depth-0 parent → child at depth 1 gets
+        'delegation' in enabled_toolsets (can further delegate)."""
+        mock_creds.return_value = {
+            "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None, "model": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal", "file"]
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = _make_role_mock_child()
+            MockAgent.return_value = mock_child
+            delegate_task(goal="test", role="orchestrator", parent_agent=parent)
+            kwargs = MockAgent.call_args[1]
+            self.assertIn("delegation", kwargs["enabled_toolsets"])
+            self.assertEqual(mock_child._delegate_role, "orchestrator")
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_orchestrator_blocked_at_max_spawn_depth(
+        self, mock_cfg, mock_creds
+    ):
+        """Parent at depth 1 with default max_spawn_depth=2 spawns child
+        at depth 2 (the floor); role='orchestrator' degrades to leaf."""
+        mock_creds.return_value = {
+            "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None, "model": None,
+        }
+        parent = _make_mock_parent(depth=1)
+        parent.enabled_toolsets = ["terminal", "delegation"]
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = _make_role_mock_child()
+            MockAgent.return_value = mock_child
+            delegate_task(goal="test", role="orchestrator", parent_agent=parent)
+            kwargs = MockAgent.call_args[1]
+            self.assertNotIn("delegation", kwargs["enabled_toolsets"])
+            self.assertEqual(mock_child._delegate_role, "leaf")
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_orchestrator_enabled_false_forces_leaf(self, mock_creds):
+        """Kill switch delegation.orchestrator_enabled=false overrides
+        role='orchestrator'."""
+        mock_creds.return_value = {
+            "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None, "model": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal", "delegation"]
+        with patch("tools.delegate_tool._load_config",
+                   return_value={"orchestrator_enabled": False}):
+            with patch("run_agent.AIAgent") as MockAgent:
+                mock_child = _make_role_mock_child()
+                MockAgent.return_value = mock_child
+                delegate_task(goal="test", role="orchestrator",
+                              parent_agent=parent)
+                kwargs = MockAgent.call_args[1]
+                self.assertNotIn("delegation", kwargs["enabled_toolsets"])
+                self.assertEqual(mock_child._delegate_role, "leaf")
+
+    # ── Role-aware system prompt ────────────────────────────────────────
+
+    def test_leaf_prompt_does_not_mention_delegation(self):
+        prompt = _build_child_system_prompt(
+            "Fix tests", role="leaf",
+            max_spawn_depth=2, child_depth=1,
+        )
+        self.assertNotIn("delegate_task", prompt)
+        self.assertNotIn("Orchestrator Role", prompt)
+
+    def test_orchestrator_prompt_mentions_delegation_capability(self):
+        prompt = _build_child_system_prompt(
+            "Survey approaches", role="orchestrator",
+            max_spawn_depth=2, child_depth=1,
+        )
+        self.assertIn("delegate_task", prompt)
+        self.assertIn("Orchestrator Role", prompt)
+        # Depth/max-depth note present and literal:
+        self.assertIn("depth 1", prompt)
+        self.assertIn("max_spawn_depth=2", prompt)
+
+    def test_orchestrator_prompt_at_depth_floor_says_children_are_leaves(self):
+        """With max_spawn_depth=2 and child_depth=1, the orchestrator's
+        own children would be at depth 2 (the floor) → must be leaves."""
+        prompt = _build_child_system_prompt(
+            "Survey", role="orchestrator",
+            max_spawn_depth=2, child_depth=1,
+        )
+        self.assertIn("MUST be leaves", prompt)
+
+    def test_orchestrator_prompt_below_floor_allows_more_nesting(self):
+        """With max_spawn_depth=3 and child_depth=1, the orchestrator's
+        own children can themselves be orchestrators (depth 2 < 3)."""
+        prompt = _build_child_system_prompt(
+            "Deep work", role="orchestrator",
+            max_spawn_depth=3, child_depth=1,
+        )
+        self.assertIn("can themselves be orchestrators", prompt)
+
+    # ── Batch mode and intersection ─────────────────────────────────────
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_batch_mode_per_task_role_override(self, mock_cfg, mock_creds):
+        """Per-task role beats top-level; no top-level role → "leaf".
+
+        tasks=[{role:'orchestrator'},{role:'leaf'},{}] → first gets
+        delegation, second and third don't.
+        """
+        mock_creds.return_value = {
+            "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None, "model": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal", "file", "delegation"]
+        built_toolsets = []
+
+        def _factory(*a, **kw):
+            m = _make_role_mock_child()
+            built_toolsets.append(kw.get("enabled_toolsets"))
+            return m
+
+        with patch("run_agent.AIAgent", side_effect=_factory):
+            delegate_task(
+                tasks=[
+                    {"goal": "A", "role": "orchestrator"},
+                    {"goal": "B", "role": "leaf"},
+                    {"goal": "C"},  # no role → falls back to top_role (leaf)
+                ],
+                parent_agent=parent,
+            )
+        self.assertIn("delegation", built_toolsets[0])
+        self.assertNotIn("delegation", built_toolsets[1])
+        self.assertNotIn("delegation", built_toolsets[2])
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_intersection_preserves_delegation_bound(
+        self, mock_cfg, mock_creds
+    ):
+        """Design decision: orchestrator capability is granted by role,
+        NOT inherited from the parent's toolset. A parent without
+        'delegation' in its enabled_toolsets can still spawn an
+        orchestrator child — the re-add in _build_child_agent runs
+        unconditionally for orchestrators.
+
+        If you want to change to "parent must have delegation too",
+        update _build_child_agent to check parent_toolsets before the
+        re-add and update this test to match.
+        """
+        mock_creds.return_value = {
+            "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None, "model": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal", "file"]  # no delegation
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = _make_role_mock_child()
+            MockAgent.return_value = mock_child
+            delegate_task(goal="test", role="orchestrator",
+                          parent_agent=parent)
+            self.assertIn("delegation", MockAgent.call_args[1]["enabled_toolsets"])
+
+
 if __name__ == "__main__":
     unittest.main()
