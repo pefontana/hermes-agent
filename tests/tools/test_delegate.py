@@ -569,8 +569,16 @@ class TestBlockedTools(unittest.TestCase):
             self.assertIn(tool, DELEGATE_BLOCKED_TOOLS)
 
     def test_constants(self):
+        from tools.delegate_tool import (
+            _get_max_spawn_depth, _get_orchestrator_enabled,
+            _MIN_SPAWN_DEPTH, _MAX_SPAWN_DEPTH_CAP,
+        )
         self.assertEqual(_get_max_concurrent_children(), 5)
         self.assertEqual(MAX_DEPTH, 2)
+        self.assertEqual(_get_max_spawn_depth(), 2)       # M3 default
+        self.assertTrue(_get_orchestrator_enabled())      # M3 default
+        self.assertEqual(_MIN_SPAWN_DEPTH, 1)
+        self.assertEqual(_MAX_SPAWN_DEPTH_CAP, 3)
 
 
 class TestDelegationCredentialResolution(unittest.TestCase):
@@ -1719,6 +1727,106 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
             delegate_task(goal="test", role="orchestrator",
                           parent_agent=parent)
             self.assertIn("delegation", MockAgent.call_args[1]["enabled_toolsets"])
+
+
+class TestOrchestratorEndToEnd(unittest.TestCase):
+    """M3 e2e: parent -> orchestrator -> leaf-leaf nested orchestration.
+
+    Satisfies parent plan §7 item 3 acceptance: "End-to-end test passes
+    with mock provider: parent delegates to orchestrator child,
+    orchestrator delegates to two leaf grandchildren, results bubble up
+    correctly."
+
+    Mock strategy (per plan §3.6 G3 sketch): a single AIAgent patch
+    with a side_effect factory that keys on the child's
+    ephemeral_system_prompt — orchestrator prompts contain the string
+    "Orchestrator Role" (see _build_child_system_prompt), leaves don't.
+    The orchestrator mock's run_conversation recursively calls
+    delegate_task with tasks=[{goal:...},{goal:...}] to spawn two
+    leaves.  This keeps the test in one patch context and avoids
+    depth-indexed nesting.
+    """
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_end_to_end_nested_orchestration(self, mock_cfg, mock_creds):
+        mock_creds.return_value = {
+            "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None, "model": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal", "file", "delegation"]
+
+        # (enabled_toolsets, _delegate_role) for each agent built
+        built_agents: list = []
+        # Keep the orchestrator mock around so the re-entrant delegate_task
+        # can reach it via closure.
+        orch_mock = {}
+
+        def _factory(*a, **kw):
+            prompt = kw.get("ephemeral_system_prompt", "") or ""
+            is_orchestrator = "Orchestrator Role" in prompt
+            m = _make_role_mock_child()
+            built_agents.append({
+                "enabled_toolsets": list(kw.get("enabled_toolsets") or []),
+                "is_orchestrator_prompt": is_orchestrator,
+            })
+
+            if is_orchestrator:
+                # Prepare the orchestrator mock as a parent-capable object
+                # so the nested delegate_task call succeeds.
+                m._delegate_depth = 1
+                m._delegate_role = "orchestrator"
+                m._active_children = []
+                m._active_children_lock = threading.Lock()
+                m._session_db = None
+                m.platform = "cli"
+                m.enabled_toolsets = ["terminal", "file", "delegation"]
+                m.api_key = "***"
+                m.base_url = ""
+                m.provider = None
+                m.api_mode = None
+                m.providers_allowed = None
+                m.providers_ignored = None
+                m.providers_order = None
+                m.provider_sort = None
+                m._print_fn = None
+                m.tool_progress_callback = None
+                m.thinking_callback = None
+                orch_mock["agent"] = m
+
+                def _orchestrator_run(user_message=None):
+                    # Re-entrant: orchestrator spawns two leaves
+                    delegate_task(
+                        tasks=[{"goal": "leaf-A"}, {"goal": "leaf-B"}],
+                        parent_agent=m,
+                    )
+                    return {
+                        "final_response": "orchestrated 2 workers",
+                        "completed": True, "api_calls": 1,
+                        "messages": [],
+                    }
+                m.run_conversation.side_effect = _orchestrator_run
+
+            return m
+
+        with patch("run_agent.AIAgent", side_effect=_factory) as MockAgent:
+            delegate_task(
+                goal="top-level orchestration",
+                role="orchestrator",
+                parent_agent=parent,
+            )
+
+        # 1 orchestrator + 2 leaf grandchildren = 3 agents
+        self.assertEqual(MockAgent.call_count, 3)
+        # First built = the orchestrator (parent's direct child)
+        self.assertIn("delegation", built_agents[0]["enabled_toolsets"])
+        self.assertTrue(built_agents[0]["is_orchestrator_prompt"])
+        # Next two = leaves (grandchildren)
+        self.assertNotIn("delegation", built_agents[1]["enabled_toolsets"])
+        self.assertFalse(built_agents[1]["is_orchestrator_prompt"])
+        self.assertNotIn("delegation", built_agents[2]["enabled_toolsets"])
+        self.assertFalse(built_agents[2]["is_orchestrator_prompt"])
 
 
 if __name__ == "__main__":
