@@ -1420,5 +1420,44 @@ class TestConcurrencyDefaults(unittest.TestCase):
         self.assertEqual(_get_max_concurrent_children(), 6)
 
 
+# =========================================================================
+# M3 — max_spawn_depth clamping (Commit 1)
+# =========================================================================
+
+class TestMaxSpawnDepth(unittest.TestCase):
+    """Tests for _get_max_spawn_depth clamping and fallback behavior."""
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_max_spawn_depth_defaults_to_2(self, mock_cfg):
+        from tools.delegate_tool import _get_max_spawn_depth
+        self.assertEqual(_get_max_spawn_depth(), 2)
+
+    @patch("tools.delegate_tool._load_config",
+           return_value={"max_spawn_depth": 0})
+    def test_max_spawn_depth_clamped_below_one(self, mock_cfg):
+        import logging
+        from tools.delegate_tool import _get_max_spawn_depth
+        with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
+            result = _get_max_spawn_depth()
+        self.assertEqual(result, 1)
+        self.assertTrue(any("clamping to 1" in m for m in cm.output))
+
+    @patch("tools.delegate_tool._load_config",
+           return_value={"max_spawn_depth": 99})
+    def test_max_spawn_depth_clamped_above_three(self, mock_cfg):
+        import logging
+        from tools.delegate_tool import _get_max_spawn_depth
+        with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
+            result = _get_max_spawn_depth()
+        self.assertEqual(result, 3)
+        self.assertTrue(any("clamping to 3" in m for m in cm.output))
+
+    @patch("tools.delegate_tool._load_config",
+           return_value={"max_spawn_depth": "not-a-number"})
+    def test_max_spawn_depth_invalid_falls_back_to_default(self, mock_cfg):
+        from tools.delegate_tool import _get_max_spawn_depth
+        self.assertEqual(_get_max_spawn_depth(), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

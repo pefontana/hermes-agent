@@ -53,6 +53,10 @@ _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 5
 _MAX_CONCURRENT_CHILDREN_CAP = 8
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
+# M3: configurable depth cap consulted by _get_max_spawn_depth; MAX_DEPTH
+# stays as the default fallback and is still the symbol tests import.
+_MIN_SPAWN_DEPTH = 1
+_MAX_SPAWN_DEPTH_CAP = 3
 
 
 def _clamp_concurrency(value: int, source: str) -> int:
@@ -96,6 +100,59 @@ def _get_max_concurrent_children() -> int:
         except (TypeError, ValueError):
             return _DEFAULT_MAX_CONCURRENT_CHILDREN
     return _DEFAULT_MAX_CONCURRENT_CHILDREN
+
+
+def _get_max_spawn_depth() -> int:
+    """Read delegation.max_spawn_depth from config, clamped to [1, 3].
+
+    depth 0 = parent agent.  max_spawn_depth = N means agents at depths
+    0..N-1 can spawn; depth N is the leaf floor.  Default 2 preserves
+    the legacy MAX_DEPTH = 2 behavior: parent spawns children (depth 1),
+    depth-1 children cannot spawn (blocked by this guard AND, for leaf
+    children, by the delegation toolset strip in _strip_blocked_tools).
+
+    With M3, role="orchestrator" removes the toolset strip for depth-1
+    children when max_spawn_depth >= 2, enabling nested orchestration.
+    """
+    cfg = _load_config()
+    val = cfg.get("max_spawn_depth")
+    if val is None:
+        return MAX_DEPTH
+    try:
+        ival = int(val)
+    except (TypeError, ValueError):
+        logger.warning(
+            "delegation.max_spawn_depth=%r is not a valid integer; "
+            "using default %d", val, MAX_DEPTH,
+        )
+        return MAX_DEPTH
+    clamped = max(_MIN_SPAWN_DEPTH, min(_MAX_SPAWN_DEPTH_CAP, ival))
+    if clamped != ival:
+        logger.warning(
+            "delegation.max_spawn_depth=%d out of range [%d, %d]; "
+            "clamping to %d", ival, _MIN_SPAWN_DEPTH,
+            _MAX_SPAWN_DEPTH_CAP, clamped,
+        )
+    return clamped
+
+
+def _get_orchestrator_enabled() -> bool:
+    """Global kill switch for the M3 orchestrator role.
+
+    When False, role="orchestrator" is silently forced to "leaf" in
+    _build_child_agent and the delegation toolset is stripped as before.
+    Lets an operator disable the feature without a code revert.
+    """
+    cfg = _load_config()
+    val = cfg.get("orchestrator_enabled", True)
+    if isinstance(val, bool):
+        return val
+    # Accept "true"/"false" strings from YAML that doesn't auto-coerce.
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes", "on")
+    return True
+
+
 DEFAULT_MAX_ITERATIONS = 50
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
@@ -697,13 +754,17 @@ def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
-    # Depth limit
+    # Depth limit (M3: configurable via delegation.max_spawn_depth,
+    # default 2 for parity with the legacy MAX_DEPTH constant).
     depth = getattr(parent_agent, '_delegate_depth', 0)
-    if depth >= MAX_DEPTH:
+    max_spawn = _get_max_spawn_depth()
+    if depth >= max_spawn:
         return json.dumps({
             "error": (
-                f"Delegation depth limit reached ({MAX_DEPTH}). "
-                "Subagents cannot spawn further subagents."
+                f"Delegation depth limit reached (depth={depth}, "
+                f"max_spawn_depth={max_spawn}). Raise "
+                f"delegation.max_spawn_depth in config.yaml if deeper "
+                f"nesting is required (cap: {_MAX_SPAWN_DEPTH_CAP})."
             )
         })
 
