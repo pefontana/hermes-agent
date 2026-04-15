@@ -1459,5 +1459,77 @@ class TestMaxSpawnDepth(unittest.TestCase):
         self.assertEqual(_get_max_spawn_depth(), 2)
 
 
+# =========================================================================
+# M3 — role param plumbing (Commit 2)
+# =========================================================================
+#
+# These tests cover the schema + signature + stash plumbing added in
+# Commit 2.  Full role-honoring behavior (toolset re-add, role-aware
+# prompt) lands in Commit 3 under the same test class, which is why the
+# tests here only assert on _delegate_role and on the schema shape.
+
+
+class TestOrchestratorRoleSchema(unittest.TestCase):
+    """Tests that the role param reaches the child via dispatch."""
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def _run_with_mock_child(self, role_arg, mock_cfg, mock_creds):
+        mock_creds.return_value = {
+            "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None, "model": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True,
+                "api_calls": 1, "messages": [],
+            }
+            mock_child._delegate_saved_tool_names = []
+            mock_child._credential_pool = None
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.model = "test"
+            MockAgent.return_value = mock_child
+            kwargs = {"goal": "test", "parent_agent": parent}
+            if role_arg is not _SENTINEL:
+                kwargs["role"] = role_arg
+            delegate_task(**kwargs)
+            return mock_child
+
+    def test_default_role_is_leaf(self):
+        child = self._run_with_mock_child(_SENTINEL)
+        self.assertEqual(child._delegate_role, "leaf")
+
+    def test_explicit_orchestrator_role_stashed(self):
+        """role='orchestrator' reaches _build_child_agent and is stashed.
+        Full behavior (toolset re-add) lands in commit 3; commit 2 only
+        verifies the plumbing."""
+        child = self._run_with_mock_child("orchestrator")
+        self.assertEqual(child._delegate_role, "orchestrator")
+
+    def test_unknown_role_coerces_to_leaf(self):
+        """role='nonsense' → _normalize_role warns and returns 'leaf'."""
+        import logging
+        with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
+            child = self._run_with_mock_child("nonsense")
+        self.assertEqual(child._delegate_role, "leaf")
+        self.assertTrue(any("coercing" in m.lower() for m in cm.output))
+
+    def test_schema_has_role_top_level_and_per_task(self):
+        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertIn("role", props)
+        self.assertEqual(props["role"]["enum"], ["leaf", "orchestrator"])
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertIn("role", task_props)
+        self.assertEqual(task_props["role"]["enum"], ["leaf", "orchestrator"])
+
+
+# Sentinel used to distinguish "role kwarg omitted" from "role=None".
+_SENTINEL = object()
+
+
 if __name__ == "__main__":
     unittest.main()

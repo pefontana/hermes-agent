@@ -72,6 +72,23 @@ def _clamp_concurrency(value: int, source: str) -> int:
     return clamped
 
 
+def _normalize_role(r: Optional[str]) -> str:
+    """Normalise a caller-provided role to 'leaf' or 'orchestrator'.
+
+    None/empty -> 'leaf'.  Unknown strings coerce to 'leaf' with a
+    warning log (matches the silent-degrade pattern of
+    _get_orchestrator_enabled).  M3 commit 3 adds a second degrade
+    layer in _build_child_agent for depth/kill-switch bounds.
+    """
+    if r is None or not r:
+        return "leaf"
+    r_norm = str(r).strip().lower()
+    if r_norm in ("leaf", "orchestrator"):
+        return r_norm
+    logger.warning("Unknown delegate_task role=%r, coercing to 'leaf'", r)
+    return "leaf"
+
+
 def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
     DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (5).
@@ -363,6 +380,9 @@ def _build_child_agent(
     # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # M3: per-call role.  Commit 2 only stashes it on the child; commit 3
+    # adds the depth/kill-switch degrade and toolset re-add logic.
+    role: str = "leaf",
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -490,6 +510,10 @@ def _build_child_agent(
     child._print_fn = getattr(parent_agent, '_print_fn', None)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = getattr(parent_agent, '_delegate_depth', 0) + 1
+    # M3: stash the normalised role for introspection.  Commit 3 will
+    # replace this with effective_role (after degrade) and use it to
+    # drive toolset re-add + role-aware prompt selection.
+    child._delegate_role = role
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -740,19 +764,28 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
+    role: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, toolsets)
-      - Batch:  provide tasks array [{goal, context, toolsets}, ...]
+      - Single: provide goal (+ optional context, toolsets, role)
+      - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
+
+    The 'role' parameter (M3) controls whether a child can further
+    delegate: 'leaf' (default) cannot; 'orchestrator' retains the
+    delegation toolset and can spawn its own workers, bounded by
+    delegation.max_spawn_depth.  Per-task role beats the top-level one.
 
     Returns JSON with results array, one entry per task.
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+
+    # Normalise the top-level role once; per-task overrides re-normalise.
+    top_role = _normalize_role(role)
 
     # Depth limit (M3: configurable via delegation.max_spawn_depth,
     # default 2 for parity with the legacy MAX_DEPTH constant).
@@ -796,7 +829,8 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "toolsets": toolsets}]
+        task_list = [{"goal": goal, "context": context,
+                      "toolsets": toolsets, "role": top_role}]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -827,6 +861,9 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
+            # Per-task role beats top-level; normalise again so unknown
+            # per-task values warn and degrade to leaf uniformly.
+            effective_role = _normalize_role(t.get("role") or top_role)
             child = _build_child_agent(
                 task_index=i, goal=t["goal"], context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets, model=creds["model"],
@@ -836,6 +873,7 @@ def delegate_task(
                 override_api_mode=creds["api_mode"],
                 override_acp_command=t.get("acp_command") or acp_command,
                 override_acp_args=t.get("acp_args") or acp_args,
+                role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -1099,8 +1137,14 @@ DELEGATE_TASK_SCHEMA = {
         "IMPORTANT:\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
         "info (file paths, error messages, constraints) via the 'context' field.\n"
-        "- Subagents CANNOT call: delegate_task, clarify, memory, send_message, "
-        "execute_code.\n"
+        "- Leaf subagents (role='leaf', the default) CANNOT call: "
+        "delegate_task, clarify, memory, send_message, execute_code.\n"
+        "- Orchestrator subagents (role='orchestrator') retain "
+        "delegate_task so they can spawn their own workers, but still "
+        "cannot use clarify, memory, send_message, or execute_code. "
+        "Orchestrators are bounded by delegation.max_spawn_depth "
+        "(default 2) and can be disabled globally via "
+        "delegation.orchestrator_enabled=false.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     ),
@@ -1156,6 +1200,11 @@ DELEGATE_TASK_SCHEMA = {
                             "items": {"type": "string"},
                             "description": "Per-task ACP args override.",
                         },
+                        "role": {
+                            "type": "string",
+                            "enum": ["leaf", "orchestrator"],
+                            "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -1173,6 +1222,19 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "Max tool-calling turns per subagent (default: 50). "
                     "Only set lower for simple tasks."
+                ),
+            },
+            "role": {
+                "type": "string",
+                "enum": ["leaf", "orchestrator"],
+                "description": (
+                    "Role of the child agent. 'leaf' (default) = focused "
+                    "worker, cannot delegate further. 'orchestrator' = can "
+                    "use delegate_task to spawn its own workers. Requires "
+                    "delegation.max_spawn_depth >= 2 in config; ignored "
+                    "(treated as 'leaf') when the child would exceed "
+                    "max_spawn_depth or when "
+                    "delegation.orchestrator_enabled=false."
                 ),
             },
             "acp_command": {
@@ -1213,6 +1275,7 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
+        role=args.get("role"),  # M3
         parent_agent=kw.get("parent_agent")),
     check_fn=check_delegate_requirements,
     emoji="🔀",
