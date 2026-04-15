@@ -1393,6 +1393,63 @@ class TestDelegateEventEnum(unittest.TestCase):
         cb("some.unknown.event", tool_name="x")
         parent._delegate_spinner.print_above.assert_not_called()
 
+    def test_progress_callback_accepts_enum_value_directly(self):
+        """cb(DelegateEvent.TASK_THINKING, ...) must route to the thinking
+        branch.  Pre-fix the callback only handled legacy strings via
+        _LEGACY_EVENT_MAP.get and silently dropped enum-typed callers."""
+        parent = _make_mock_parent()
+        parent._delegate_spinner = MagicMock()
+        parent.tool_progress_callback = None
+
+        cb = _build_child_progress_callback(0, parent, task_count=1)
+        cb(DelegateEvent.TASK_THINKING, preview="pondering")
+        # If the enum was accepted, the thinking emoji got printed.
+        assert any(
+            "💭" in str(c)
+            for c in parent._delegate_spinner.print_above.call_args_list
+        )
+
+    def test_progress_callback_accepts_new_style_string(self):
+        """cb('delegate.task_thinking', ...) — the string form of the
+        enum value — must route to the thinking branch too, so new-style
+        emitters don't have to import DelegateEvent."""
+        parent = _make_mock_parent()
+        parent._delegate_spinner = MagicMock()
+
+        cb = _build_child_progress_callback(0, parent, task_count=1)
+        cb("delegate.task_thinking", preview="hmm")
+        assert any(
+            "💭" in str(c)
+            for c in parent._delegate_spinner.print_above.call_args_list
+        )
+
+    def test_progress_callback_task_progress_not_misrendered(self):
+        """'subagent_progress' (legacy name for TASK_PROGRESS) carries a
+        pre-batched summary in the tool_name slot.  Before the fix, this
+        fell through to the TASK_TOOL_STARTED rendering path, treating
+        the summary string as a tool name.  After the fix: distinct
+        render (no tool-start emoji lookup) and pass-through relay
+        upward (no re-batching).
+
+        Regression reachable in M3 only: nested orchestrators relay
+        subagent_progress from grandchildren upward through this path.
+        """
+        parent = _make_mock_parent()
+        parent._delegate_spinner = MagicMock()
+        parent.tool_progress_callback = MagicMock()
+
+        cb = _build_child_progress_callback(0, parent, task_count=1)
+        cb("subagent_progress", tool_name="🔀 [1] terminal, file")
+
+        # Spinner gets a distinct 🔀-prefixed line, NOT a tool emoji
+        # followed by the summary string as if it were a tool name.
+        calls = parent._delegate_spinner.print_above.call_args_list
+        self.assertTrue(any("🔀 🔀 [1] terminal, file" in str(c) for c in calls))
+        # Parent callback receives the relay (pass-through, no re-batching).
+        parent.tool_progress_callback.assert_called_once()
+        # No '⚡' tool-start emoji should appear — that's the pre-fix bug.
+        self.assertFalse(any("⚡" in str(c) for c in calls))
+
 
 class TestConcurrencyDefaults(unittest.TestCase):
     """Tests for the new concurrency default and cap."""

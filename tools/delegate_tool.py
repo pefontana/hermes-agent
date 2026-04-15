@@ -353,11 +353,20 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
     _BATCH_SIZE = 5
     _batch: List[str] = []
 
-    def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
-        # Normalise legacy event strings to DelegateEvent enum.
-        event = _LEGACY_EVENT_MAP.get(event_type)
-        if event is None:
-            return  # Unknown event — ignore
+    def _callback(event_type, tool_name: str = None, preview: str = None, args=None, **kwargs):
+        # Normalise legacy strings, new-style "delegate.*" strings, and
+        # DelegateEvent enum values all to a single DelegateEvent.  Before
+        # M3 this only accepted the five legacy strings; enum-typed callers
+        # were silently dropped.
+        if isinstance(event_type, DelegateEvent):
+            event = event_type
+        else:
+            event = _LEGACY_EVENT_MAP.get(event_type)
+            if event is None:
+                try:
+                    event = DelegateEvent(event_type)
+                except (ValueError, TypeError):
+                    return  # Unknown event — ignore
 
         if event == DelegateEvent.TASK_THINKING:
             text = preview or tool_name or ""
@@ -371,6 +380,27 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
             return
 
         if event == DelegateEvent.TASK_TOOL_COMPLETED:
+            return
+
+        if event == DelegateEvent.TASK_PROGRESS:
+            # Pre-batched progress summary relayed from a nested
+            # orchestrator's grandchild (upstream emits as
+            # parent_cb("subagent_progress", summary_string) where the
+            # summary lands in the tool_name positional slot).  Treat as
+            # a pass-through: render distinctly (not via the tool-start
+            # emoji lookup, which would mistake the summary string for a
+            # tool name) and relay upward without re-batching.
+            summary_text = tool_name or preview or ""
+            if spinner and summary_text:
+                try:
+                    spinner.print_above(f" {prefix}├─ 🔀 {summary_text}")
+                except Exception as e:
+                    logger.debug("Spinner print_above failed: %s", e)
+            if parent_cb:
+                try:
+                    parent_cb("subagent_progress", f"{prefix}{summary_text}")
+                except Exception as e:
+                    logger.debug("Parent callback relay failed: %s", e)
             return
 
         # TASK_TOOL_STARTED — display and batch for parent relay
