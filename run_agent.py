@@ -6888,12 +6888,11 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
-    def _dispatch_delegate_task(self, function_args: dict, messages: list = None) -> str:
-        """Forward delegate_task with the full schema to avoid param drift.
+    def _dispatch_delegate_task(self, function_args: dict) -> str:
+        """Single call site for delegate_task dispatch.
 
-        Every parameter in DELEGATE_TASK_SCHEMA is forwarded from function_args
-        so that new schema fields (acp_command, acp_args, and any future
-        additions) are never silently dropped by a stale call site.
+        New DELEGATE_TASK_SCHEMA fields only need to be added here to reach all
+        invocation paths (concurrent, sequential, inline).
         """
         from tools.delegate_tool import delegate_task as _delegate_task
         return _delegate_task(
@@ -6905,7 +6904,6 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             parent_agent=self,
-            messages=messages,
         )
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
@@ -6977,7 +6975,7 @@ class AIAgent:
                 callback=self.clarify_callback,
             )
         elif function_name == "delegate_task":
-            return self._dispatch_delegate_task(function_args, messages)
+            return self._dispatch_delegate_task(function_args)
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -7373,7 +7371,7 @@ class AIAgent:
                 self._delegate_spinner = spinner
                 _delegate_result = None
                 try:
-                    function_result = self._dispatch_delegate_task(function_args, messages)
+                    function_result = self._dispatch_delegate_task(function_args)
                     _delegate_result = function_result
                 finally:
                     self._delegate_spinner = None

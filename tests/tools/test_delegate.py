@@ -1321,26 +1321,6 @@ class TestDispatchDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["override_acp_command"], "claude")
             self.assertEqual(kwargs["override_acp_args"], ["--acp", "--stdio"])
 
-    @patch("tools.delegate_tool._load_config", return_value={})
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    def test_dispatch_helper_passes_messages(self, mock_creds, mock_cfg):
-        """_dispatch_delegate_task threads messages to delegate_task."""
-        mock_creds.return_value = {
-            "provider": None, "base_url": None,
-            "api_key": None, "api_mode": None, "model": None,
-        }
-        parent = _make_mock_parent(depth=0)
-        messages = [{"role": "user", "content": "hello"}]
-
-        with patch("tools.delegate_tool.delegate_task") as mock_dt:
-            mock_dt.return_value = "{}"
-            from run_agent import AIAgent
-            # Call through the dispatch helper
-            AIAgent._dispatch_delegate_task(parent, {"goal": "test"}, messages)
-            call_kwargs = mock_dt.call_args
-            self.assertIs(call_kwargs[1]["messages"], messages)
-
-
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 

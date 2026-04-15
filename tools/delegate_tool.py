@@ -684,7 +684,6 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     parent_agent=None,
-    messages: Optional[list] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
