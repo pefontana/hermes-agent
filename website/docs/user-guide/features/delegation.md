@@ -154,8 +154,8 @@ The `toolsets` parameter controls what tools the subagent has access to. Choose 
 | `["file"]` | Read-only analysis, code review without execution |
 | `["terminal"]` | System administration, process management |
 
-Certain toolsets are **always blocked** for subagents regardless of what you specify:
-- `delegation` — no recursive delegation (prevents infinite spawning)
+Certain toolsets are blocked for subagents regardless of what you specify:
+- `delegation` — blocked for leaf subagents (the default). Retained for `role="orchestrator"` children, bounded by `max_spawn_depth` — see [Depth Limit and Nested Orchestration](#depth-limit-and-nested-orchestration) below.
 - `clarify` — subagents cannot interact with the user
 - `memory` — no writes to shared persistent memory
 - `code_execution` — children should reason step-by-step
