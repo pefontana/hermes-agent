@@ -53,6 +53,7 @@ Wire protocol
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import os
@@ -61,6 +62,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -232,11 +234,13 @@ def _parse_hooks_block(hooks_cfg: Any) -> List[ShellHookSpec]:
 
     for event_name, entries in hooks_cfg.items():
         if event_name not in VALID_HOOKS:
-            suggestion = _nearest_event(event_name, VALID_HOOKS)
+            suggestion = difflib.get_close_matches(
+                str(event_name), VALID_HOOKS, n=1, cutoff=0.6,
+            )
             if suggestion:
                 logger.warning(
                     "unknown hook event %r in hooks: config — did you mean %r?",
-                    event_name, suggestion,
+                    event_name, suggestion[0],
                 )
             else:
                 logger.warning(
@@ -321,33 +325,70 @@ def _parse_single_entry(
     )
 
 
-def _nearest_event(query: str, valid: Set[str]) -> Optional[str]:
-    """Tiny edit-distance-ish helper so config typos get a helpful hint."""
-    if not query or not isinstance(query, str):
-        return None
-    query_lower = query.lower()
-    best: Optional[str] = None
-    best_score = -1.0
-    for candidate in valid:
-        score = _similarity(query_lower, candidate.lower())
-        if score > best_score:
-            best = candidate
-            best_score = score
-    if best_score >= 0.6:
-        return best
-    return None
-
-
-def _similarity(a: str, b: str) -> float:
-    if not a or not b:
-        return 0.0
-    common = sum(1 for ch in a if ch in b)
-    return common / max(len(a), len(b))
-
-
 # ---------------------------------------------------------------------------
 # Subprocess callback
 # ---------------------------------------------------------------------------
+
+_TOP_LEVEL_PAYLOAD_KEYS = {"tool_name", "args", "session_id", "parent_session_id"}
+
+
+def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
+    """Run ``spec.command`` as a subprocess with ``stdin_json`` on stdin.
+
+    Returns a diagnostic dict with the same keys for every outcome
+    (``returncode``, ``stdout``, ``stderr``, ``timed_out``,
+    ``elapsed_seconds``, ``error``).  This is the single place the
+    subprocess is actually invoked — both the live callback path
+    (:func:`_make_callback`) and the CLI test helper (:func:`run_once`)
+    go through it.
+    """
+    result: Dict[str, Any] = {
+        "returncode": None,
+        "stdout": "",
+        "stderr": "",
+        "timed_out": False,
+        "elapsed_seconds": 0.0,
+        "error": None,
+    }
+    try:
+        argv = shlex.split(os.path.expanduser(spec.command))
+    except ValueError as exc:
+        result["error"] = f"command {spec.command!r} cannot be parsed: {exc}"
+        return result
+    if not argv:
+        result["error"] = "empty command"
+        return result
+
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(
+            argv,
+            input=stdin_json,
+            capture_output=True,
+            timeout=spec.timeout,
+            text=True,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired:
+        result["timed_out"] = True
+        result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
+        return result
+    except FileNotFoundError:
+        result["error"] = "command not found"
+        return result
+    except PermissionError:
+        result["error"] = "command not executable"
+        return result
+    except Exception as exc:  # pragma: no cover — defensive
+        result["error"] = str(exc)
+        return result
+
+    result["returncode"] = proc.returncode
+    result["stdout"] = proc.stdout or ""
+    result["stderr"] = proc.stderr or ""
+    result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
+    return result
+
 
 def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]]]:
     """Build the closure that ``invoke_hook()`` will call per firing."""
@@ -355,74 +396,38 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
     def _callback(**kwargs: Any) -> Optional[Dict[str, Any]]:
         # Matcher gate — only meaningful for tool-scoped events.
         if spec.event in ("pre_tool_call", "post_tool_call"):
-            tool_name = kwargs.get("tool_name")
-            if not spec.matches_tool(tool_name):
+            if not spec.matches_tool(kwargs.get("tool_name")):
                 return None
 
-        payload = _serialize_payload(spec.event, kwargs)
-        try:
-            argv = shlex.split(os.path.expanduser(spec.command))
-        except ValueError as exc:
+        r = _spawn(spec, _serialize_payload(spec.event, kwargs))
+
+        if r["error"]:
             logger.warning(
-                "shell hook command %r cannot be parsed: %s",
-                spec.command, exc,
+                "shell hook failed (event=%s command=%s): %s",
+                spec.event, spec.command, r["error"],
+            )
+            return None
+        if r["timed_out"]:
+            logger.warning(
+                "shell hook timed out after %.2fs (event=%s command=%s)",
+                r["elapsed_seconds"], spec.event, spec.command,
             )
             return None
 
-        if not argv:
-            return None
-
-        try:
-            proc = subprocess.run(
-                argv,
-                input=payload,
-                capture_output=True,
-                timeout=spec.timeout,
-                text=True,
-                shell=False,
-            )
-        except subprocess.TimeoutExpired:
-            logger.warning(
-                "shell hook timed out after %ds: event=%s command=%s",
-                spec.timeout, spec.event, spec.command,
-            )
-            return None
-        except FileNotFoundError:
-            logger.warning(
-                "shell hook command not found: %s (event=%s)",
-                spec.command, spec.event,
-            )
-            return None
-        except PermissionError:
-            logger.warning(
-                "shell hook command not executable: %s (event=%s)",
-                spec.command, spec.event,
-            )
-            return None
-        except Exception as exc:  # pragma: no cover — defensive
-            logger.warning(
-                "shell hook subprocess failed: event=%s command=%s error=%s",
-                spec.event, spec.command, exc,
-            )
-            return None
-
-        stderr = (proc.stderr or "").strip()
+        stderr = r["stderr"].strip()
         if stderr:
             logger.debug(
                 "shell hook stderr (event=%s command=%s): %s",
                 spec.event, spec.command, stderr[:400],
             )
-
-        # Non-zero exits: log as a warning but always parse stdout anyway.
-        # This preserves block intent when a script signals failure via exit
-        # code *and* prints a JSON payload on stdout — a common pattern.
-        if proc.returncode != 0:
+        # Non-zero exits: log but still parse stdout so scripts that
+        # signal failure via exit code can also return a block directive.
+        if r["returncode"] != 0:
             logger.warning(
                 "shell hook exited %d (event=%s command=%s); stderr=%s",
-                proc.returncode, spec.event, spec.command, stderr[:400],
+                r["returncode"], spec.event, spec.command, stderr[:400],
             )
-
-        return _parse_response(spec.event, proc.stdout)
+        return _parse_response(spec.event, r["stdout"])
 
     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
     _callback.__qualname__ = _callback.__name__
@@ -430,52 +435,22 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
 
 
 def _serialize_payload(event: str, kwargs: Dict[str, Any]) -> str:
-    """Render the stdin JSON payload.  Always produces valid JSON — any
-    unserialisable field is rendered as its string form via ``default=str``.
-    """
-    payload: Dict[str, Any] = {
+    """Render the stdin JSON payload.  Unserialisable values are
+    stringified via ``default=str`` rather than dropped."""
+    extras = {k: v for k, v in kwargs.items() if k not in _TOP_LEVEL_PAYLOAD_KEYS}
+    try:
+        cwd = str(Path.cwd())
+    except OSError:
+        cwd = ""
+    payload = {
         "hook_event_name": event,
         "tool_name": kwargs.get("tool_name"),
         "tool_input": kwargs.get("args") if isinstance(kwargs.get("args"), dict) else None,
-        "session_id": (
-            kwargs.get("session_id")
-            or kwargs.get("parent_session_id")
-            or ""
-        ),
-        "cwd": _safe_cwd(),
-        "extra": _safe_extras(kwargs),
+        "session_id": kwargs.get("session_id") or kwargs.get("parent_session_id") or "",
+        "cwd": cwd,
+        "extra": extras,
     }
-    try:
-        return json.dumps(payload, ensure_ascii=False, default=str)
-    except Exception:
-        # Last-resort fallback — keeps the script invocation alive even
-        # if the kwargs contain genuinely weird objects.
-        return json.dumps(
-            {"hook_event_name": event, "extra": {}}, ensure_ascii=False,
-        )
-
-
-def _safe_cwd() -> str:
-    try:
-        return str(Path.cwd())
-    except (FileNotFoundError, OSError):
-        return ""
-
-
-def _safe_extras(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """Capture event-specific kwargs minus the fields already lifted to
-    top-level.  Lossy for non-JSON types — those get stringified."""
-    top_level = {"tool_name", "args", "session_id", "parent_session_id"}
-    extras: Dict[str, Any] = {}
-    for k, v in kwargs.items():
-        if k in top_level:
-            continue
-        try:
-            json.dumps(v, default=str)
-            extras[k] = v
-        except Exception:
-            extras[k] = str(v)
-    return extras
+    return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:
@@ -612,36 +587,25 @@ def _prompt_and_record(
 
 def _record_approval(event: str, command: str) -> None:
     data = load_allowlist()
-    mtime_str: Optional[str] = None
-    path = _command_script_path(command)
-    if path:
-        try:
-            expanded = os.path.expanduser(path)
-            mtime_str = datetime.fromtimestamp(
-                os.path.getmtime(expanded), tz=timezone.utc,
-            ).isoformat().replace("+00:00", "Z")
-        except OSError:
-            mtime_str = None
-
     entry = {
         "event": event,
         "command": command,
-        "approved_at": datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
-        "script_mtime_at_approval": mtime_str,
+        "approved_at": _utc_now_iso(),
+        "script_mtime_at_approval": script_mtime_iso(command),
     }
-    approvals = data.setdefault("approvals", [])
-    # Keep at most one entry per (event, command) pair
-    approvals = [
-        e for e in approvals
+    data["approvals"] = [
+        e for e in data.get("approvals", [])
         if not (
             isinstance(e, dict)
             and e.get("event") == event
             and e.get("command") == command
         )
-    ]
-    approvals.append(entry)
-    data["approvals"] = approvals
+    ] + [entry]
     save_allowlist(data)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def revoke(command: str) -> int:
@@ -742,66 +706,13 @@ def run_once(
     spec: ShellHookSpec, payload: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Fire a single shell-hook invocation with a synthetic payload.
-    Used by ``hermes hooks test`` and ``hermes hooks doctor``.
-
-    Returns a diagnostic dict with ``returncode``, ``stdout``, ``stderr``,
-    ``parsed``, ``timed_out`` and ``elapsed_seconds`` keys — all fields
-    always present so callers can render a consistent table.
-    """
-    import time
-
-    result: Dict[str, Any] = {
-        "returncode": None,
-        "stdout": "",
-        "stderr": "",
-        "parsed": None,
-        "timed_out": False,
-        "elapsed_seconds": 0.0,
-        "error": None,
-    }
-
-    try:
-        argv = shlex.split(os.path.expanduser(spec.command))
-    except ValueError as exc:
-        result["error"] = f"Cannot parse command: {exc}"
-        return result
-
-    if not argv:
-        result["error"] = "Empty command"
-        return result
-
-    input_json = json.dumps(
+    Used by ``hermes hooks test`` and ``hermes hooks doctor``.  Adds a
+    ``parsed`` field to the :func:`_spawn` diagnostic dict with the
+    canonical wire-shape output."""
+    stdin_json = json.dumps(
         {"hook_event_name": spec.event, **payload},
         ensure_ascii=False, default=str,
     )
-
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(
-            argv,
-            input=input_json,
-            capture_output=True,
-            timeout=spec.timeout,
-            text=True,
-            shell=False,
-        )
-    except subprocess.TimeoutExpired:
-        result["timed_out"] = True
-        result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
-        return result
-    except FileNotFoundError:
-        result["error"] = "Command not found"
-        return result
-    except PermissionError:
-        result["error"] = "Command not executable"
-        return result
-    except Exception as exc:  # pragma: no cover — defensive
-        result["error"] = str(exc)
-        return result
-
-    result["returncode"] = proc.returncode
-    result["stdout"] = proc.stdout or ""
-    result["stderr"] = proc.stderr or ""
-    result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
-    result["parsed"] = _parse_response(spec.event, proc.stdout or "")
+    result = _spawn(spec, stdin_json)
+    result["parsed"] = _parse_response(spec.event, result["stdout"])
     return result
