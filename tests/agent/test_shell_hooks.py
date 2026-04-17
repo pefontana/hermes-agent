@@ -494,3 +494,31 @@ class TestIdempotentRegistration:
         # Only one callback on the manager
         mgr = plugins.get_plugin_manager()
         assert len(mgr._hooks.get("on_session_start", [])) == 1
+
+    def test_same_command_different_matcher_registers_both(
+        self, tmp_path, monkeypatch,
+    ):
+        """Same script used for different matchers under one event must
+        register both callbacks — dedupe keys on (event, matcher, command)."""
+        from hermes_cli import plugins
+
+        script = _write_script(tmp_path, "h.sh",
+                               "#!/usr/bin/env bash\nprintf '{}\\n'\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("HERMES_ACCEPT_HOOKS", "1")
+
+        plugins._plugin_manager = plugins.PluginManager()
+
+        cfg = {
+            "hooks": {
+                "pre_tool_call": [
+                    {"matcher": "terminal", "command": str(script)},
+                    {"matcher": "web_search", "command": str(script)},
+                ],
+            },
+        }
+
+        registered = shell_hooks.register_from_config(cfg, accept_hooks=True)
+        assert len(registered) == 2
+        mgr = plugins.get_plugin_manager()
+        assert len(mgr._hooks.get("pre_tool_call", [])) == 2

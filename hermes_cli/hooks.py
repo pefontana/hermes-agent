@@ -105,47 +105,52 @@ def _cmd_list(_args) -> None:
 # test
 # ---------------------------------------------------------------------------
 
+# Synthetic kwargs matching the real invoke_hook() call sites — these are
+# passed verbatim to agent.shell_hooks.run_once(), which routes them through
+# the same _serialize_payload() that production firings use.  That way the
+# stdin a script sees under `hermes hooks test` and `hermes hooks doctor`
+# is identical in shape to what it will see at runtime.
 _DEFAULT_PAYLOADS = {
     "pre_tool_call": {
         "tool_name": "terminal",
-        "tool_input": {"command": "echo hello"},
-        "extra": {"task_id": "test-task", "tool_call_id": "test-call"},
+        "args": {"command": "echo hello"},
+        "session_id": "test-session",
+        "task_id": "test-task",
+        "tool_call_id": "test-call",
     },
     "post_tool_call": {
         "tool_name": "terminal",
-        "tool_input": {"command": "echo hello"},
-        "extra": {
-            "task_id": "test-task",
-            "tool_call_id": "test-call",
-            "result": "{\"output\": \"hello\"}",
-        },
+        "args": {"command": "echo hello"},
+        "session_id": "test-session",
+        "task_id": "test-task",
+        "tool_call_id": "test-call",
+        "result": '{"output": "hello"}',
     },
     "pre_llm_call": {
-        "extra": {
-            "user_message": "What is the weather?",
-            "conversation_history": [],
-            "is_first_turn": True,
-            "model": "gpt-4",
-            "platform": "cli",
-        },
+        "session_id": "test-session",
+        "user_message": "What is the weather?",
+        "conversation_history": [],
+        "is_first_turn": True,
+        "model": "gpt-4",
+        "platform": "cli",
     },
     "post_llm_call": {
-        "extra": {"model": "gpt-4", "platform": "cli"},
+        "session_id": "test-session",
+        "model": "gpt-4",
+        "platform": "cli",
     },
-    "on_session_start": {"extra": {}},
-    "on_session_end": {"extra": {}},
-    "on_session_finalize": {"extra": {}},
-    "on_session_reset": {"extra": {}},
-    "pre_api_request": {"extra": {}},
-    "post_api_request": {"extra": {}},
+    "on_session_start": {"session_id": "test-session"},
+    "on_session_end": {"session_id": "test-session"},
+    "on_session_finalize": {"session_id": "test-session"},
+    "on_session_reset": {"session_id": "test-session"},
+    "pre_api_request": {"session_id": "test-session"},
+    "post_api_request": {"session_id": "test-session"},
     "subagent_stop": {
-        "extra": {
-            "parent_session_id": "parent-sess",
-            "child_role": None,
-            "child_summary": "Synthetic summary for hooks test",
-            "child_status": "completed",
-            "duration_ms": 1234,
-        },
+        "parent_session_id": "parent-sess",
+        "child_role": None,
+        "child_summary": "Synthetic summary for hooks test",
+        "child_status": "completed",
+        "duration_ms": 1234,
     },
 }
 
@@ -161,7 +166,9 @@ def _cmd_test(args) -> None:
         print(f"Valid events: {', '.join(sorted(VALID_HOOKS))}")
         return
 
-    payload = dict(_DEFAULT_PAYLOADS.get(event, {"extra": {}}))
+    # Synthetic kwargs in the same shape invoke_hook() would pass.  Merged
+    # with --for-tool (overrides tool_name) and --payload-file (extra kwargs).
+    payload = dict(_DEFAULT_PAYLOADS.get(event, {"session_id": "test-session"}))
 
     if getattr(args, "for_tool", None):
         payload["tool_name"] = args.for_tool

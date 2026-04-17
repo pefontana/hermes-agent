@@ -6602,26 +6602,29 @@ Examples:
         cmd_version(args)
         return
 
-    # Discover plugins and wire shell-script hooks once, before any command
-    # dispatch that may fire lifecycle hooks (on_session_start etc.).  Both
-    # the Python-plugin loader and the shell-hooks bridge are idempotent, so
-    # subcommand handlers can re-call these safely.  Failures are logged but
-    # non-fatal — a broken hook must never prevent the CLI from starting.
+    # Discover Python plugins and register shell hooks once, before any
+    # command that can fire lifecycle hooks (on_session_start etc.).
+    # Both the plugin loader and the shell-hooks bridge are idempotent,
+    # so subcommand handlers can re-call these safely.  Failures are
+    # logged but never block the CLI.
     #
-    # Shell-hook registration is gated to commands that actually run the
-    # agent.  Introspection-only commands (`hermes hooks list`, `version`,
-    # `doctor`, ...) would otherwise trigger the first-use consent prompt
-    # for any hook that isn't allowlisted yet — a bad UX, and actively
-    # wrong for the `hooks` subcommand itself (whose whole purpose is
-    # inspecting unconfigured hooks).
+    # Gated to commands that actually run the agent.  Introspection-only
+    # commands (hermes hooks list, version, doctor, ...) would otherwise
+    # pay plugin-discovery cost and trigger plugin register() side
+    # effects — and shell-hook registration would prompt for consent on
+    # un-allowlisted hooks the user is still inspecting.  Pre-PR plugin
+    # discovery was lazy (via model_tools import side-effect), so
+    # non-agent commands never paid that cost; keep it that way.
     _AGENT_COMMANDS = {None, "chat", "gateway", "acp", "mcp", "cron", "rl"}
-    _accept_hooks = bool(getattr(args, "accept_hooks", False))
-    try:
-        from hermes_cli.plugins import discover_plugins
-        discover_plugins()
-    except Exception:
-        logger.debug("plugin discovery failed at CLI startup", exc_info=True)
     if args.command in _AGENT_COMMANDS:
+        _accept_hooks = bool(getattr(args, "accept_hooks", False))
+        try:
+            from hermes_cli.plugins import discover_plugins
+            discover_plugins()
+        except Exception:
+            logger.debug(
+                "plugin discovery failed at CLI startup", exc_info=True,
+            )
         try:
             from hermes_cli.config import load_config
             from agent.shell_hooks import register_from_config

@@ -76,10 +76,13 @@ DEFAULT_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 300
 ALLOWLIST_FILENAME = "shell-hooks-allowlist.json"
 
-# (event, command) pairs that have been wired to the plugin manager in the
-# current process.  Second registration attempts become no-ops so the CLI
-# and gateway can both call register_from_config() safely.
-_registered: Set[Tuple[str, str]] = set()
+# (event, matcher, command) triples that have been wired to the plugin
+# manager in the current process.  Matcher is part of the key because
+# the same script can legitimately register for different matchers under
+# the same event (e.g. one entry per tool the user wants to gate).
+# Second registration attempts for the exact same triple become no-ops
+# so the CLI and gateway can both call register_from_config() safely.
+_registered: Set[Tuple[str, Optional[str], str]] = set()
 _registered_lock = threading.Lock()
 
 
@@ -164,12 +167,12 @@ def register_from_config(
     manager = get_plugin_manager()
 
     for spec in specs:
-        key = (spec.event, spec.command)
+        key = (spec.event, spec.matcher, spec.command)
         with _registered_lock:
             if key in _registered:
                 logger.debug(
-                    "shell hook %s -> %s already registered, skipping",
-                    spec.event, spec.command,
+                    "shell hook %s [matcher=%s] -> %s already registered, "
+                    "skipping", spec.event, spec.matcher, spec.command,
                 )
                 continue
 
@@ -527,12 +530,16 @@ def load_allowlist() -> Dict[str, Any]:
 
 
 def save_allowlist(data: Dict[str, Any]) -> None:
-    """Persist the allowlist.  Silently no-ops on OSError — the caller
-    already logged the broader context."""
+    """Persist the allowlist atomically.  Uses tmp + os.replace so a
+    concurrent reader or a process killed mid-write never sees truncated
+    JSON.  Silently no-ops on OSError — the caller already logged the
+    broader context."""
     p = allowlist_path()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(data, indent=2, sort_keys=True))
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+        os.replace(tmp, p)
     except OSError as exc:
         logger.warning("Failed to write shell hook allowlist: %s", exc)
 
@@ -703,16 +710,20 @@ def script_is_executable(command: str) -> bool:
 
 
 def run_once(
-    spec: ShellHookSpec, payload: Dict[str, Any],
+    spec: ShellHookSpec, kwargs: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Fire a single shell-hook invocation with a synthetic payload.
-    Used by ``hermes hooks test`` and ``hermes hooks doctor``.  Adds a
-    ``parsed`` field to the :func:`_spawn` diagnostic dict with the
-    canonical wire-shape output."""
-    stdin_json = json.dumps(
-        {"hook_event_name": spec.event, **payload},
-        ensure_ascii=False, default=str,
-    )
+    Used by ``hermes hooks test`` and ``hermes hooks doctor``.
+
+    ``kwargs`` is the same dict that :func:`hermes_cli.plugins.invoke_hook`
+    would pass at runtime.  It is routed through :func:`_serialize_payload`
+    so the synthetic stdin exactly matches what a real hook firing would
+    produce — otherwise scripts tested via ``hermes hooks test`` could
+    diverge silently from production behaviour.
+
+    Returns the :func:`_spawn` diagnostic dict plus a ``parsed`` field
+    holding the canonical Hermes-wire-shape response."""
+    stdin_json = _serialize_payload(spec.event, kwargs)
     result = _spawn(spec, stdin_json)
     result["parsed"] = _parse_response(spec.event, result["stdout"])
     return result

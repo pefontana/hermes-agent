@@ -81,6 +81,37 @@ class TestHooksList:
 
 
 class TestHooksTest:
+    def test_synthetic_payload_matches_production_shape(self, tmp_path):
+        """`hermes hooks test` must feed the script stdin in the same
+        shape invoke_hook() would at runtime.  Prior to this fix,
+        run_once bypassed _serialize_payload and the two paths diverged —
+        scripts tested with `hermes hooks test` saw different top-level
+        keys than at runtime, silently breaking in production."""
+        capture = tmp_path / "captured.json"
+        script = _hook_script(
+            tmp_path,
+            f"#!/usr/bin/env bash\ncat - > {capture}\nprintf '{{}}\\n'\n",
+        )
+        cfg = {"hooks": {"subagent_stop": [{"command": str(script)}]}}
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            _run(SimpleNamespace(
+                hooks_action="test", event="subagent_stop",
+                for_tool=None, payload_file=None,
+            ))
+
+        seen = json.loads(capture.read_text())
+        # Same top-level keys _serialize_payload produces at runtime
+        assert set(seen.keys()) == {
+            "hook_event_name", "tool_name", "tool_input",
+            "session_id", "cwd", "extra",
+        }
+        # parent_session_id was routed to top-level session_id (matches runtime)
+        assert seen["session_id"] == "parent-sess"
+        assert "parent_session_id" not in seen["extra"]
+        # subagent_stop has no tool, so tool_name / tool_input are null
+        assert seen["tool_name"] is None
+        assert seen["tool_input"] is None
+
     def test_fires_real_subprocess_and_parses_block(self, tmp_path):
         block_script = _hook_script(
             tmp_path,
