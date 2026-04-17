@@ -1821,6 +1821,25 @@ class GatewayRunner:
                 "or configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id)."
             )
         
+        # Register declarative shell hooks from cli-config.yaml.  Gateway
+        # has no TTY, so consent has to come from one of the three opt-in
+        # channels (--accept-hooks on launch, HERMES_ACCEPT_HOOKS env var,
+        # or hooks_auto_accept: true in config.yaml).  Failures are logged
+        # but must never block gateway startup.
+        try:
+            from hermes_cli.config import load_config
+            from agent.shell_hooks import register_from_config
+            _cfg = load_config()
+            register_from_config(
+                _cfg,
+                accept_hooks=bool(_cfg.get("hooks_auto_accept", False)),
+            )
+        except Exception:
+            logger.debug(
+                "shell-hook registration failed at gateway startup",
+                exc_info=True,
+            )
+
         # Discover and load event hooks
         self.hooks.discover_and_load()
         
