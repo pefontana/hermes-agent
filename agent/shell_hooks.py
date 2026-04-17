@@ -1,0 +1,807 @@
+"""
+Shell-script hooks bridge.
+
+Reads the ``hooks:`` block from ``cli-config.yaml``, prompts the user for
+consent on first use of each ``(event, command)`` pair, and registers
+callbacks on the existing plugin hook manager so every existing
+``invoke_hook()`` site dispatches to the configured shell scripts — with
+zero changes to call sites.
+
+Design notes
+------------
+* Python plugins and shell hooks compose naturally: both flow through
+  :func:`hermes_cli.plugins.invoke_hook` and its aggregators.  Python
+  plugins are registered first (via ``discover_and_load()``) so their
+  block decisions win ties over shell-hook blocks.
+* Subprocess execution uses ``shlex.split(os.path.expanduser(command))``
+  with ``shell=False`` — no shell injection footguns.  Users that need
+  pipes/redirection wrap their logic in a script.
+* First-use consent is gated by the allowlist under
+  ``~/.hermes/shell-hooks-allowlist.json``.  Non-TTY callers must pass
+  ``accept_hooks=True`` (resolved from ``--accept-hooks``,
+  ``HERMES_ACCEPT_HOOKS``, or ``hooks_auto_accept: true`` in config)
+  for registration to succeed without a prompt.
+* Registration is idempotent — safe to invoke from both the CLI entry
+  point (``hermes_cli/main.py``) and the gateway entry point
+  (``gateway/run.py``).
+
+Wire protocol
+-------------
+**stdin** (JSON, piped to the script)::
+
+    {
+        "hook_event_name": "pre_tool_call",
+        "tool_name":       "terminal",
+        "tool_input":      {"command": "rm -rf /"},
+        "session_id":      "sess_abc123",
+        "cwd":             "/home/user/project",
+        "extra":           {...}   # event-specific kwargs
+    }
+
+**stdout** (JSON, optional — anything else is ignored)::
+
+    # Block a pre_tool_call (either shape accepted; normalised internally):
+    {"decision": "block", "reason":  "Forbidden command"}   # Claude-Code-style
+    {"action":   "block", "message": "Forbidden command"}   # Hermes-canonical
+
+    # Inject context for pre_llm_call:
+    {"context": "Today is Friday"}
+
+    # Silent no-op:
+    <empty or any non-matching JSON object>
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shlex
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+from hermes_constants import get_hermes_home
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_TIMEOUT_SECONDS = 60
+MAX_TIMEOUT_SECONDS = 300
+ALLOWLIST_FILENAME = "shell-hooks-allowlist.json"
+
+# (event, command) pairs that have been wired to the plugin manager in the
+# current process.  Second registration attempts become no-ops so the CLI
+# and gateway can both call register_from_config() safely.
+_registered: Set[Tuple[str, str]] = set()
+_registered_lock = threading.Lock()
+
+
+@dataclass
+class ShellHookSpec:
+    """Parsed and validated representation of a single ``hooks:`` entry."""
+
+    event: str
+    command: str
+    matcher: Optional[str] = None
+    timeout: int = DEFAULT_TIMEOUT_SECONDS
+    compiled_matcher: Optional[re.Pattern] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        # Strip whitespace introduced by YAML quirks (e.g. multi-line string
+        # folding) — a matcher of " terminal" would otherwise silently fail
+        # to match "terminal" without any diagnostic.
+        if isinstance(self.matcher, str):
+            stripped = self.matcher.strip()
+            self.matcher = stripped if stripped else None
+        if self.matcher:
+            try:
+                self.compiled_matcher = re.compile(self.matcher)
+            except re.error as exc:
+                logger.warning(
+                    "shell hook matcher %r is invalid (%s) — treating as "
+                    "literal equality", self.matcher, exc,
+                )
+                self.compiled_matcher = None
+
+    def matches_tool(self, tool_name: Optional[str]) -> bool:
+        if not self.matcher:
+            return True
+        if tool_name is None:
+            return False
+        if self.compiled_matcher is not None:
+            return self.compiled_matcher.fullmatch(tool_name) is not None
+        # compiled_matcher is None only when the regex failed to compile,
+        # in which case we already warned and fall back to literal equality.
+        return tool_name == self.matcher
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def register_from_config(
+    cfg: Optional[Dict[str, Any]],
+    *,
+    accept_hooks: bool = False,
+) -> List[ShellHookSpec]:
+    """Register every configured shell hook on the plugin manager.
+
+    ``cfg`` is the full parsed config dict (``hermes_cli.config.load_config``
+    output).  The ``hooks:`` key is read out of it.  Missing, empty, or
+    non-dict ``hooks`` is treated as zero configured hooks.
+
+    ``accept_hooks=True`` skips the TTY consent prompt — the caller is
+    promising that the user has opted in via a flag, env var, or config
+    setting.  ``HERMES_ACCEPT_HOOKS=1`` and ``hooks_auto_accept: true`` are
+    also honored inside this function so either CLI or gateway call sites
+    pick them up.
+
+    Returns the list of :class:`ShellHookSpec` entries that ended up wired
+    up on the plugin manager.  Skipped entries (unknown events, malformed,
+    not allowlisted, already registered) are logged but not returned.
+    """
+    if not isinstance(cfg, dict):
+        return []
+
+    effective_accept = _resolve_effective_accept(cfg, accept_hooks)
+
+    specs = _parse_hooks_block(cfg.get("hooks"))
+    if not specs:
+        return []
+
+    registered: List[ShellHookSpec] = []
+
+    # Import lazily — avoids circular imports at module-load time.
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+
+    for spec in specs:
+        key = (spec.event, spec.command)
+        with _registered_lock:
+            if key in _registered:
+                logger.debug(
+                    "shell hook %s -> %s already registered, skipping",
+                    spec.event, spec.command,
+                )
+                continue
+
+            if not _is_allowlisted(spec.event, spec.command):
+                approved = _prompt_and_record(
+                    spec.event, spec.command,
+                    accept_hooks=effective_accept,
+                )
+                if not approved:
+                    logger.warning(
+                        "shell hook for %s (command: %s) is not allowlisted — "
+                        "registration skipped.  Run `hermes hooks list` to "
+                        "see pending hooks, or re-run with --accept-hooks / "
+                        "set HERMES_ACCEPT_HOOKS=1 / hooks_auto_accept: true "
+                        "in config.yaml.",
+                        spec.event, spec.command,
+                    )
+                    continue
+
+            callback = _make_callback(spec)
+            manager._hooks.setdefault(spec.event, []).append(callback)
+            _registered.add(key)
+            registered.append(spec)
+            logger.info(
+                "shell hook registered: %s -> %s (matcher=%s, timeout=%ds)",
+                spec.event, spec.command, spec.matcher, spec.timeout,
+            )
+
+    return registered
+
+
+def iter_configured_hooks(cfg: Optional[Dict[str, Any]]) -> List[ShellHookSpec]:
+    """Return the parsed ``ShellHookSpec`` entries from config without
+    registering anything.  Used by ``hermes hooks list`` and ``doctor``."""
+    if not isinstance(cfg, dict):
+        return []
+    return _parse_hooks_block(cfg.get("hooks"))
+
+
+def reset_for_tests() -> None:
+    """Clear the idempotence set.  Test-only helper."""
+    with _registered_lock:
+        _registered.clear()
+
+
+# ---------------------------------------------------------------------------
+# Config parsing
+# ---------------------------------------------------------------------------
+
+def _parse_hooks_block(hooks_cfg: Any) -> List[ShellHookSpec]:
+    """Normalise the ``hooks:`` dict into a flat list of ``ShellHookSpec``.
+
+    Malformed entries warn-and-skip — we never raise from config parsing
+    because a broken hook must not crash the agent.
+    """
+    from hermes_cli.plugins import VALID_HOOKS
+
+    if not isinstance(hooks_cfg, dict):
+        return []
+
+    specs: List[ShellHookSpec] = []
+
+    for event_name, entries in hooks_cfg.items():
+        if event_name not in VALID_HOOKS:
+            suggestion = _nearest_event(event_name, VALID_HOOKS)
+            if suggestion:
+                logger.warning(
+                    "unknown hook event %r in hooks: config — did you mean %r?",
+                    event_name, suggestion,
+                )
+            else:
+                logger.warning(
+                    "unknown hook event %r in hooks: config (valid: %s)",
+                    event_name, ", ".join(sorted(VALID_HOOKS)),
+                )
+            continue
+
+        if entries is None:
+            continue
+
+        if not isinstance(entries, list):
+            logger.warning(
+                "hooks.%s must be a list of hook definitions; got %s",
+                event_name, type(entries).__name__,
+            )
+            continue
+
+        for i, raw in enumerate(entries):
+            spec = _parse_single_entry(event_name, i, raw)
+            if spec is not None:
+                specs.append(spec)
+
+    return specs
+
+
+def _parse_single_entry(
+    event: str, index: int, raw: Any,
+) -> Optional[ShellHookSpec]:
+    if not isinstance(raw, dict):
+        logger.warning(
+            "hooks.%s[%d] must be a mapping with a 'command' key; got %s",
+            event, index, type(raw).__name__,
+        )
+        return None
+
+    command = raw.get("command")
+    if not isinstance(command, str) or not command.strip():
+        logger.warning(
+            "hooks.%s[%d] is missing a non-empty 'command' field",
+            event, index,
+        )
+        return None
+
+    matcher = raw.get("matcher")
+    if matcher is not None and not isinstance(matcher, str):
+        logger.warning(
+            "hooks.%s[%d].matcher must be a string regex; ignoring",
+            event, index,
+        )
+        matcher = None
+
+    timeout_raw = raw.get("timeout", DEFAULT_TIMEOUT_SECONDS)
+    try:
+        timeout = int(timeout_raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "hooks.%s[%d].timeout must be an int (got %r); using default %ds",
+            event, index, timeout_raw, DEFAULT_TIMEOUT_SECONDS,
+        )
+        timeout = DEFAULT_TIMEOUT_SECONDS
+
+    if timeout < 1:
+        logger.warning(
+            "hooks.%s[%d].timeout must be >=1; using default %ds",
+            event, index, DEFAULT_TIMEOUT_SECONDS,
+        )
+        timeout = DEFAULT_TIMEOUT_SECONDS
+
+    if timeout > MAX_TIMEOUT_SECONDS:
+        logger.warning(
+            "hooks.%s[%d].timeout=%ds exceeds max %ds; clamping",
+            event, index, timeout, MAX_TIMEOUT_SECONDS,
+        )
+        timeout = MAX_TIMEOUT_SECONDS
+
+    return ShellHookSpec(
+        event=event,
+        command=command.strip(),
+        matcher=matcher,
+        timeout=timeout,
+    )
+
+
+def _nearest_event(query: str, valid: Set[str]) -> Optional[str]:
+    """Tiny edit-distance-ish helper so config typos get a helpful hint."""
+    if not query or not isinstance(query, str):
+        return None
+    query_lower = query.lower()
+    best: Optional[str] = None
+    best_score = -1.0
+    for candidate in valid:
+        score = _similarity(query_lower, candidate.lower())
+        if score > best_score:
+            best = candidate
+            best_score = score
+    if best_score >= 0.6:
+        return best
+    return None
+
+
+def _similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    common = sum(1 for ch in a if ch in b)
+    return common / max(len(a), len(b))
+
+
+# ---------------------------------------------------------------------------
+# Subprocess callback
+# ---------------------------------------------------------------------------
+
+def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]]]:
+    """Build the closure that ``invoke_hook()`` will call per firing."""
+
+    def _callback(**kwargs: Any) -> Optional[Dict[str, Any]]:
+        # Matcher gate — only meaningful for tool-scoped events.
+        if spec.event in ("pre_tool_call", "post_tool_call"):
+            tool_name = kwargs.get("tool_name")
+            if not spec.matches_tool(tool_name):
+                return None
+
+        payload = _serialize_payload(spec.event, kwargs)
+        try:
+            argv = shlex.split(os.path.expanduser(spec.command))
+        except ValueError as exc:
+            logger.warning(
+                "shell hook command %r cannot be parsed: %s",
+                spec.command, exc,
+            )
+            return None
+
+        if not argv:
+            return None
+
+        try:
+            proc = subprocess.run(
+                argv,
+                input=payload,
+                capture_output=True,
+                timeout=spec.timeout,
+                text=True,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "shell hook timed out after %ds: event=%s command=%s",
+                spec.timeout, spec.event, spec.command,
+            )
+            return None
+        except FileNotFoundError:
+            logger.warning(
+                "shell hook command not found: %s (event=%s)",
+                spec.command, spec.event,
+            )
+            return None
+        except PermissionError:
+            logger.warning(
+                "shell hook command not executable: %s (event=%s)",
+                spec.command, spec.event,
+            )
+            return None
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                "shell hook subprocess failed: event=%s command=%s error=%s",
+                spec.event, spec.command, exc,
+            )
+            return None
+
+        stderr = (proc.stderr or "").strip()
+        if stderr:
+            logger.debug(
+                "shell hook stderr (event=%s command=%s): %s",
+                spec.event, spec.command, stderr[:400],
+            )
+
+        # Non-zero exits: log as a warning but always parse stdout anyway.
+        # This preserves block intent when a script signals failure via exit
+        # code *and* prints a JSON payload on stdout — a common pattern.
+        if proc.returncode != 0:
+            logger.warning(
+                "shell hook exited %d (event=%s command=%s); stderr=%s",
+                proc.returncode, spec.event, spec.command, stderr[:400],
+            )
+
+        return _parse_response(spec.event, proc.stdout)
+
+    _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
+    _callback.__qualname__ = _callback.__name__
+    return _callback
+
+
+def _serialize_payload(event: str, kwargs: Dict[str, Any]) -> str:
+    """Render the stdin JSON payload.  Always produces valid JSON — any
+    unserialisable field is rendered as its string form via ``default=str``.
+    """
+    payload: Dict[str, Any] = {
+        "hook_event_name": event,
+        "tool_name": kwargs.get("tool_name"),
+        "tool_input": kwargs.get("args") if isinstance(kwargs.get("args"), dict) else None,
+        "session_id": (
+            kwargs.get("session_id")
+            or kwargs.get("parent_session_id")
+            or ""
+        ),
+        "cwd": _safe_cwd(),
+        "extra": _safe_extras(kwargs),
+    }
+    try:
+        return json.dumps(payload, ensure_ascii=False, default=str)
+    except Exception:
+        # Last-resort fallback — keeps the script invocation alive even
+        # if the kwargs contain genuinely weird objects.
+        return json.dumps(
+            {"hook_event_name": event, "extra": {}}, ensure_ascii=False,
+        )
+
+
+def _safe_cwd() -> str:
+    try:
+        return str(Path.cwd())
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def _safe_extras(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Capture event-specific kwargs minus the fields already lifted to
+    top-level.  Lossy for non-JSON types — those get stringified."""
+    top_level = {"tool_name", "args", "session_id", "parent_session_id"}
+    extras: Dict[str, Any] = {}
+    for k, v in kwargs.items():
+        if k in top_level:
+            continue
+        try:
+            json.dumps(v, default=str)
+            extras[k] = v
+        except Exception:
+            extras[k] = str(v)
+    return extras
+
+
+def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:
+    """Translate stdout JSON into a Hermes wire-shape dict.
+
+    For ``pre_tool_call`` the Claude-Code-style ``{"decision": "block",
+    "reason": "..."}`` payload is translated into the canonical Hermes
+    ``{"action": "block", "message": "..."}`` shape expected by
+    :func:`hermes_cli.plugins.get_pre_tool_call_block_message`.  This is
+    the single most important correctness invariant in this module —
+    skipping the translation silently breaks every ``pre_tool_call``
+    block directive.
+
+    For ``pre_llm_call``, ``{"context": "..."}`` is passed through
+    unchanged to match the existing plugin-hook contract.
+
+    Anything else returns ``None``.
+    """
+    stdout = (stdout or "").strip()
+    if not stdout:
+        return None
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        logger.warning(
+            "shell hook stdout was not valid JSON (event=%s): %s",
+            event, stdout[:200],
+        )
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    if event == "pre_tool_call":
+        if data.get("action") == "block":
+            message = data.get("message") or data.get("reason") or ""
+            if isinstance(message, str) and message:
+                return {"action": "block", "message": message}
+        if data.get("decision") == "block":
+            message = data.get("reason") or data.get("message") or ""
+            if isinstance(message, str) and message:
+                return {"action": "block", "message": message}
+        return None
+
+    context = data.get("context")
+    if isinstance(context, str) and context.strip():
+        return {"context": context}
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Allowlist / consent
+# ---------------------------------------------------------------------------
+
+def allowlist_path() -> Path:
+    """Path to the per-user shell-hook allowlist file."""
+    return get_hermes_home() / ALLOWLIST_FILENAME
+
+
+def load_allowlist() -> Dict[str, Any]:
+    """Return the parsed allowlist, or an empty skeleton if absent."""
+    try:
+        raw = json.loads(allowlist_path().read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"approvals": []}
+    if not isinstance(raw, dict):
+        return {"approvals": []}
+    approvals = raw.get("approvals")
+    if not isinstance(approvals, list):
+        raw["approvals"] = []
+    return raw
+
+
+def save_allowlist(data: Dict[str, Any]) -> None:
+    """Persist the allowlist.  Silently no-ops on OSError — the caller
+    already logged the broader context."""
+    p = allowlist_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, indent=2, sort_keys=True))
+    except OSError as exc:
+        logger.warning("Failed to write shell hook allowlist: %s", exc)
+
+
+def _is_allowlisted(event: str, command: str) -> bool:
+    data = load_allowlist()
+    return any(
+        isinstance(e, dict)
+        and e.get("event") == event
+        and e.get("command") == command
+        for e in data.get("approvals", [])
+    )
+
+
+def _prompt_and_record(
+    event: str, command: str, *, accept_hooks: bool,
+) -> bool:
+    """Decide whether to approve an unseen ``(event, command)`` pair.
+    Returns ``True`` iff the approval was granted and recorded.
+    """
+    if accept_hooks:
+        _record_approval(event, command)
+        logger.info(
+            "shell hook auto-approved via --accept-hooks / env / config: "
+            "%s -> %s", event, command,
+        )
+        return True
+
+    if not sys.stdin.isatty():
+        return False
+
+    print(
+        f"\n⚠ Hermes is about to register a shell hook that will run a\n"
+        f"  command on your behalf.\n\n"
+        f"    Event:   {event}\n"
+        f"    Command: {command}\n\n"
+        f"  Commands run with your full user credentials.  Only approve\n"
+        f"  commands you trust."
+    )
+    try:
+        answer = input("Allow this hook to run? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()  # keep the terminal tidy after ^C
+        return False
+
+    if answer in ("y", "yes"):
+        _record_approval(event, command)
+        return True
+
+    return False
+
+
+def _record_approval(event: str, command: str) -> None:
+    data = load_allowlist()
+    mtime_str: Optional[str] = None
+    path = _command_script_path(command)
+    if path:
+        try:
+            expanded = os.path.expanduser(path)
+            mtime_str = datetime.fromtimestamp(
+                os.path.getmtime(expanded), tz=timezone.utc,
+            ).isoformat().replace("+00:00", "Z")
+        except OSError:
+            mtime_str = None
+
+    entry = {
+        "event": event,
+        "command": command,
+        "approved_at": datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+        "script_mtime_at_approval": mtime_str,
+    }
+    approvals = data.setdefault("approvals", [])
+    # Keep at most one entry per (event, command) pair
+    approvals = [
+        e for e in approvals
+        if not (
+            isinstance(e, dict)
+            and e.get("event") == event
+            and e.get("command") == command
+        )
+    ]
+    approvals.append(entry)
+    data["approvals"] = approvals
+    save_allowlist(data)
+
+
+def revoke(command: str) -> int:
+    """Remove every allowlist entry matching ``command``.
+
+    Returns the number of entries removed.  Does not unregister any
+    callbacks that are already live on the plugin manager in the current
+    process — restart the CLI / gateway to drop them.
+    """
+    data = load_allowlist()
+    before = len(data.get("approvals", []))
+    data["approvals"] = [
+        e for e in data.get("approvals", [])
+        if not (isinstance(e, dict) and e.get("command") == command)
+    ]
+    save_allowlist(data)
+    return before - len(data["approvals"])
+
+
+def _command_script_path(command: str) -> str:
+    """Return the first token of ``command`` — the script or binary path."""
+    try:
+        parts = shlex.split(command)
+        if parts:
+            return parts[0]
+    except ValueError:
+        pass
+    return command
+
+
+# ---------------------------------------------------------------------------
+# Helpers for accept-hooks resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_effective_accept(
+    cfg: Dict[str, Any], accept_hooks_arg: bool,
+) -> bool:
+    """Combine all three opt-in channels into a single boolean.
+
+    Precedence (any truthy source flips us on):
+      1. ``--accept-hooks`` flag (CLI) / explicit argument
+      2. ``HERMES_ACCEPT_HOOKS`` env var
+      3. ``hooks_auto_accept: true`` in ``cli-config.yaml``
+    """
+    if accept_hooks_arg:
+        return True
+    env = os.environ.get("HERMES_ACCEPT_HOOKS", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    cfg_val = cfg.get("hooks_auto_accept", False)
+    return bool(cfg_val)
+
+
+# ---------------------------------------------------------------------------
+# Introspection (used by `hermes hooks` CLI)
+# ---------------------------------------------------------------------------
+
+def allowlist_entry_for(event: str, command: str) -> Optional[Dict[str, Any]]:
+    """Return the allowlist record for this pair, if any."""
+    for e in load_allowlist().get("approvals", []):
+        if (
+            isinstance(e, dict)
+            and e.get("event") == event
+            and e.get("command") == command
+        ):
+            return e
+    return None
+
+
+def script_mtime_iso(command: str) -> Optional[str]:
+    """ISO-8601 mtime of the resolved script path, or ``None`` if the
+    script is missing."""
+    path = _command_script_path(command)
+    if not path:
+        return None
+    try:
+        expanded = os.path.expanduser(path)
+        return datetime.fromtimestamp(
+            os.path.getmtime(expanded), tz=timezone.utc,
+        ).isoformat().replace("+00:00", "Z")
+    except OSError:
+        return None
+
+
+def script_is_executable(command: str) -> bool:
+    """Return ``True`` iff the first token of ``command`` resolves to an
+    executable file on disk."""
+    path = _command_script_path(command)
+    if not path:
+        return False
+    expanded = os.path.expanduser(path)
+    if not os.path.isfile(expanded):
+        return False
+    return os.access(expanded, os.X_OK)
+
+
+def run_once(
+    spec: ShellHookSpec, payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Fire a single shell-hook invocation with a synthetic payload.
+    Used by ``hermes hooks test`` and ``hermes hooks doctor``.
+
+    Returns a diagnostic dict with ``returncode``, ``stdout``, ``stderr``,
+    ``parsed``, ``timed_out`` and ``elapsed_seconds`` keys — all fields
+    always present so callers can render a consistent table.
+    """
+    import time
+
+    result: Dict[str, Any] = {
+        "returncode": None,
+        "stdout": "",
+        "stderr": "",
+        "parsed": None,
+        "timed_out": False,
+        "elapsed_seconds": 0.0,
+        "error": None,
+    }
+
+    try:
+        argv = shlex.split(os.path.expanduser(spec.command))
+    except ValueError as exc:
+        result["error"] = f"Cannot parse command: {exc}"
+        return result
+
+    if not argv:
+        result["error"] = "Empty command"
+        return result
+
+    input_json = json.dumps(
+        {"hook_event_name": spec.event, **payload},
+        ensure_ascii=False, default=str,
+    )
+
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(
+            argv,
+            input=input_json,
+            capture_output=True,
+            timeout=spec.timeout,
+            text=True,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired:
+        result["timed_out"] = True
+        result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
+        return result
+    except FileNotFoundError:
+        result["error"] = "Command not found"
+        return result
+    except PermissionError:
+        result["error"] = "Command not executable"
+        return result
+    except Exception as exc:  # pragma: no cover — defensive
+        result["error"] = str(exc)
+        return result
+
+    result["returncode"] = proc.returncode
+    result["stdout"] = proc.stdout or ""
+    result["stderr"] = proc.stderr or ""
+    result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
+    result["parsed"] = _parse_response(spec.event, proc.stdout or "")
+    return result
