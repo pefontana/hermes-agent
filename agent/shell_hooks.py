@@ -325,6 +325,15 @@ def _parse_single_entry(
         )
         matcher = None
 
+    if matcher is not None and event not in ("pre_tool_call", "post_tool_call"):
+        logger.warning(
+            "hooks.%s[%d].matcher=%r will be ignored at runtime — the "
+            "matcher field is only honored for pre_tool_call / "
+            "post_tool_call.  The hook will fire on every %s event.",
+            event, index, matcher, event,
+        )
+        matcher = None
+
     timeout_raw = raw.get("timeout", DEFAULT_TIMEOUT_SECONDS)
     try:
         timeout = int(timeout_raw)
@@ -563,12 +572,18 @@ def save_allowlist(data: Dict[str, Any]) -> None:
     unique temp file (``tempfile.mkstemp`` in the same directory) so two
     concurrent writers cannot ``os.replace`` each other's temp file out
     from under them — prior versions used a fixed ``…allowlist.json.tmp``
-    path which produced ``ENOENT`` under contention.  Silently no-ops on
-    OSError — the caller already logged broader context.
+    path which produced ``ENOENT`` under contention.
 
     Read-modify-write races (two processes both reading the file, each
-    appending an approval, second write overwrites the first) are handled
-    by :func:`_locked_update_approvals` via ``fcntl.flock``."""
+    appending an approval, second write overwrites the first) are
+    handled by :func:`_locked_update_approvals` via ``fcntl.flock``.
+
+    On OSError the write is logged at WARNING with enough context for
+    the user to diagnose (full allowlist path, specific errno) — the
+    in-process hook still registers, so the user won't be re-prompted
+    in the current CLI / gateway run, but next startup will re-prompt
+    because the approval never hit disk.  The caller does not see the
+    failure; the warning is the only signal."""
     p = allowlist_path()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -586,7 +601,13 @@ def save_allowlist(data: Dict[str, Any]) -> None:
                 pass
             raise
     except OSError as exc:
-        logger.warning("Failed to write shell hook allowlist: %s", exc)
+        logger.warning(
+            "Failed to persist shell hook allowlist to %s: %s. "
+            "The approval is in-memory for this run, but the next "
+            "startup will re-prompt (or skip registration on non-TTY "
+            "runs without --accept-hooks / HERMES_ACCEPT_HOOKS).",
+            p, exc,
+        )
 
 
 def _is_allowlisted(event: str, command: str) -> bool:

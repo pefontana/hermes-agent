@@ -470,6 +470,36 @@ class TestParseHooksBlock:
         assert shell_hooks._parse_hooks_block("string") == []
         assert shell_hooks._parse_hooks_block([]) == []
 
+    def test_non_tool_event_matcher_warns_and_drops(self, caplog):
+        """``matcher:`` is only consulted for pre_tool_call /
+        post_tool_call.  Configuring a matcher on any other event used
+        to parse silently and then be ignored at runtime — the hook
+        would fire on every event regardless of the matcher string,
+        which is exactly the opposite of what the user wanted.  Parse
+        time must now warn and drop the matcher so the rendered spec
+        and ``hermes hooks list`` output match runtime behaviour."""
+        import logging
+
+        cfg = {
+            "pre_llm_call": [
+                {"matcher": "terminal", "command": "/bin/echo hi"},
+            ],
+        }
+        with caplog.at_level(logging.WARNING, logger=shell_hooks.logger.name):
+            specs = shell_hooks._parse_hooks_block(cfg)
+
+        assert len(specs) == 1
+        assert specs[0].matcher is None, (
+            "matcher must be dropped so the spec reflects runtime"
+        )
+        warning = next(
+            (r.getMessage() for r in caplog.records
+             if "only honored for pre_tool_call" in r.getMessage()),
+            None,
+        )
+        assert warning is not None
+        assert "pre_llm_call" in warning
+
 
 # ── Idempotent registration ───────────────────────────────────────────────
 
@@ -604,6 +634,33 @@ class TestAllowlistConcurrency:
         assert shell_hooks._is_allowlisted(
             "on_session_start", "/bin/x.sh",
         )
+
+    def test_save_allowlist_failure_logs_actionable_warning(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """When the allowlist can't be written (disk full, read-only
+        ``~/.hermes``, permission denied), the warning must tell the
+        user (1) where we tried to write and (2) that the approval
+        will not survive across runs.  Otherwise the symptom is just
+        "hermes keeps asking me about the same hook every time"."""
+        import logging
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+        def raise_oserror(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(shell_hooks.tempfile, "mkstemp", raise_oserror)
+
+        with caplog.at_level(logging.WARNING, logger=shell_hooks.logger.name):
+            shell_hooks.save_allowlist({"approvals": []})
+
+        msgs = [r.getMessage() for r in caplog.records]
+        warning = next((m for m in msgs if "Failed to persist" in m), None)
+        assert warning is not None, f"no persistence warning in {msgs!r}"
+        assert "shell-hooks-allowlist.json" in warning
+        assert "No space left on device" in warning
+        assert "re-prompt" in warning
 
     def test_command_script_path_resolution(self):
         """Regression: ``_command_script_path`` used to return the first
