@@ -181,48 +181,34 @@ def register_from_config(
 
     manager = get_plugin_manager()
 
+    # Idempotence + allowlist read happen under the lock; the TTY
+    # prompt runs outside so other threads aren't parked on a blocking
+    # input().  Mutation re-takes the lock with a defensive idempotence
+    # re-check in case two callers ever race through the prompt.
     for spec in specs:
         key = (spec.event, spec.matcher, spec.command)
-
-        # Check idempotence and allowlist status under the lock, but
-        # never hold the lock across the potentially-long TTY consent
-        # prompt.  Concurrent callers that block on a prompt would
-        # otherwise park other registration threads indefinitely even
-        # though they have nothing to do with this spec.
         with _registered_lock:
             if key in _registered:
-                logger.debug(
-                    "shell hook %s [matcher=%s] -> %s already registered, "
-                    "skipping", spec.event, spec.matcher, spec.command,
-                )
                 continue
             already_allowlisted = _is_allowlisted(spec.event, spec.command)
 
         if not already_allowlisted:
-            approved = _prompt_and_record(
-                spec.event, spec.command,
-                accept_hooks=effective_accept,
-            )
-            if not approved:
+            if not _prompt_and_record(
+                spec.event, spec.command, accept_hooks=effective_accept,
+            ):
                 logger.warning(
-                    "shell hook for %s (command: %s) is not allowlisted — "
-                    "registration skipped.  Re-run with --accept-hooks / "
-                    "set HERMES_ACCEPT_HOOKS=1 / hooks_auto_accept: true "
-                    "in config.yaml, or approve interactively at the TTY "
-                    "prompt on the next run.",
+                    "shell hook for %s (%s) not allowlisted — skipped. "
+                    "Use --accept-hooks / HERMES_ACCEPT_HOOKS=1 / "
+                    "hooks_auto_accept: true, or approve at the TTY "
+                    "prompt next run.",
                     spec.event, spec.command,
                 )
                 continue
 
         with _registered_lock:
-            # Defensive re-check — registration is single-threaded at
-            # every in-tree call site today, but if a future caller
-            # parallelised it, two threads that both cleared the prompt
-            # would otherwise double-register the same callback.
             if key in _registered:
                 continue
-            callback = _make_callback(spec)
-            manager._hooks.setdefault(spec.event, []).append(callback)
+            manager._hooks.setdefault(spec.event, []).append(_make_callback(spec))
             _registered.add(key)
             registered.append(spec)
             logger.info(
@@ -568,22 +554,11 @@ def load_allowlist() -> Dict[str, Any]:
 
 
 def save_allowlist(data: Dict[str, Any]) -> None:
-    """Persist the allowlist atomically.  Each writer uses a per-process
-    unique temp file (``tempfile.mkstemp`` in the same directory) so two
-    concurrent writers cannot ``os.replace`` each other's temp file out
-    from under them — prior versions used a fixed ``…allowlist.json.tmp``
-    path which produced ``ENOENT`` under contention.
-
-    Read-modify-write races (two processes both reading the file, each
-    appending an approval, second write overwrites the first) are
-    handled by :func:`_locked_update_approvals` via ``fcntl.flock``.
-
-    On OSError the write is logged at WARNING with enough context for
-    the user to diagnose (full allowlist path, specific errno) — the
-    in-process hook still registers, so the user won't be re-prompted
-    in the current CLI / gateway run, but next startup will re-prompt
-    because the approval never hit disk.  The caller does not see the
-    failure; the warning is the only signal."""
+    """Atomically persist the allowlist via per-process ``mkstemp`` +
+    ``os.replace``.  Cross-process read-modify-write races are handled
+    by :func:`_locked_update_approvals` (``fcntl.flock``).  On OSError
+    the failure is logged; the in-process hook still registers but
+    the approval won't survive across runs."""
     p = allowlist_path()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -737,26 +712,12 @@ _SCRIPT_EXTENSIONS: Tuple[str, ...] = (
 
 
 def _command_script_path(command: str) -> str:
-    """Return the path of the user's hook script.
+    """Return the script path from ``command`` for doctor / drift checks.
 
-    Handles bare commands (``/path/hook.sh``), interpreter-prefixed
-    commands (``python3 /path/hook.py``, ``bash ~/hook.sh``), and
-    ``env``-shebang forms (``/usr/bin/env python3 /path/hook.py``).
-    ``_spawn`` happily accepts all of these via ``shlex.split`` +
-    ``shell=False``, but ``script_is_executable`` / ``script_mtime_iso``
-    used to look only at ``argv[0]`` — so a hook declared as
-    ``python3 hook.py`` reported "script missing or not executable" in
-    `hermes hooks doctor` and silently skipped mtime drift detection.
-
-    Resolution order:
-
-    1. First token ending in a known script extension (``.sh``,
-       ``.py``, ``.rb``, ...) — catches the interpreter-prefixed case
-       unambiguously even through ``/usr/bin/env INTERP SCRIPT``.
-    2. Otherwise, first token containing a path separator or starting
-       with ``~`` — preserves the bare-path case (``/bin/echo hi``).
-    3. Otherwise, the first token — preserves behaviour for bare-name
-       entries on ``$PATH``.
+    Prefers a token ending in a known script extension, then a token
+    containing ``/`` or leading ``~``, then the first token.  Handles
+    ``python3 /path/hook.py``, ``/usr/bin/env bash hook.sh``, and the
+    common bare-path form.
     """
     try:
         parts = shlex.split(command)
