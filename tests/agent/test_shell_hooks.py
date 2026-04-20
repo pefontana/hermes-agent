@@ -605,6 +605,40 @@ class TestAllowlistConcurrency:
             "on_session_start", "/bin/x.sh",
         )
 
+    def test_command_script_path_resolution(self):
+        """Regression: ``_command_script_path`` used to return the first
+        shlex token, which picked the interpreter (``python3``, ``bash``,
+        ``/usr/bin/env``) instead of the actual script for any
+        interpreter-prefixed command.  That broke
+        ``hermes hooks doctor``'s executability check and silently
+        disabled mtime drift detection for such hooks."""
+        cases = [
+            # bare path
+            ("/path/hook.sh", "/path/hook.sh"),
+            ("/bin/echo hi", "/bin/echo"),
+            ("~/hook.sh", "~/hook.sh"),
+            ("hook.sh", "hook.sh"),
+            # interpreter prefix
+            ("python3 /path/hook.py", "/path/hook.py"),
+            ("bash /path/hook.sh", "/path/hook.sh"),
+            ("bash ~/hook.sh", "~/hook.sh"),
+            ("python3 -u /path/hook.py", "/path/hook.py"),
+            ("nice -n 10 /path/hook.sh", "/path/hook.sh"),
+            # /usr/bin/env shebang form — must find the *script*, not env
+            ("/usr/bin/env python3 /path/hook.py", "/path/hook.py"),
+            ("/usr/bin/env bash /path/hook.sh", "/path/hook.sh"),
+            # no path-like tokens → fallback to first token
+            ("my-binary --verbose", "my-binary"),
+            ("python3 -c 'print(1)'", "python3"),
+            # unparseable (unbalanced quotes) → return command as-is
+            ("python3 'unterminated", "python3 'unterminated"),
+            # empty
+            ("", ""),
+        ]
+        for command, expected in cases:
+            got = shell_hooks._command_script_path(command)
+            assert got == expected, f"{command!r} -> {got!r}, expected {expected!r}"
+
     def test_save_allowlist_uses_unique_tmp_paths(self, tmp_path, monkeypatch):
         """Two save_allowlist calls in flight must use distinct tmp files
         so the loser's os.replace does not ENOENT on the winner's sweep."""

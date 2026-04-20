@@ -693,15 +693,49 @@ def revoke(command: str) -> int:
     return before - after
 
 
+_SCRIPT_EXTENSIONS: Tuple[str, ...] = (
+    ".sh", ".bash", ".zsh", ".fish",
+    ".py", ".pyw",
+    ".rb", ".pl", ".lua",
+    ".js", ".mjs", ".cjs", ".ts",
+)
+
+
 def _command_script_path(command: str) -> str:
-    """Return the first token of ``command`` — the script or binary path."""
+    """Return the path of the user's hook script.
+
+    Handles bare commands (``/path/hook.sh``), interpreter-prefixed
+    commands (``python3 /path/hook.py``, ``bash ~/hook.sh``), and
+    ``env``-shebang forms (``/usr/bin/env python3 /path/hook.py``).
+    ``_spawn`` happily accepts all of these via ``shlex.split`` +
+    ``shell=False``, but ``script_is_executable`` / ``script_mtime_iso``
+    used to look only at ``argv[0]`` — so a hook declared as
+    ``python3 hook.py`` reported "script missing or not executable" in
+    `hermes hooks doctor` and silently skipped mtime drift detection.
+
+    Resolution order:
+
+    1. First token ending in a known script extension (``.sh``,
+       ``.py``, ``.rb``, ...) — catches the interpreter-prefixed case
+       unambiguously even through ``/usr/bin/env INTERP SCRIPT``.
+    2. Otherwise, first token containing a path separator or starting
+       with ``~`` — preserves the bare-path case (``/bin/echo hi``).
+    3. Otherwise, the first token — preserves behaviour for bare-name
+       entries on ``$PATH``.
+    """
     try:
         parts = shlex.split(command)
-        if parts:
-            return parts[0]
     except ValueError:
-        pass
-    return command
+        return command
+    if not parts:
+        return command
+    for part in parts:
+        if part.lower().endswith(_SCRIPT_EXTENSIONS):
+            return part
+    for part in parts:
+        if "/" in part or part.startswith("~"):
+            return part
+    return parts[0]
 
 
 # ---------------------------------------------------------------------------
