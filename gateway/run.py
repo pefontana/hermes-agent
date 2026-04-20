@@ -1838,16 +1838,16 @@ class GatewayRunner:
         # Register declarative shell hooks from cli-config.yaml.  Gateway
         # has no TTY, so consent has to come from one of the three opt-in
         # channels (--accept-hooks on launch, HERMES_ACCEPT_HOOKS env var,
-        # or hooks_auto_accept: true in config.yaml).  Failures are logged
-        # but must never block gateway startup.
+        # or hooks_auto_accept: true in config.yaml).  We pass
+        # accept_hooks=False here and let register_from_config resolve
+        # the effective value from env + config itself — the CLI-side
+        # registration already honored --accept-hooks, and re-reading
+        # hooks_auto_accept here would just duplicate that lookup.
+        # Failures are logged but must never block gateway startup.
         try:
             from hermes_cli.config import load_config
             from agent.shell_hooks import register_from_config
-            _cfg = load_config()
-            register_from_config(
-                _cfg,
-                accept_hooks=bool(_cfg.get("hooks_auto_accept", False)),
-            )
+            register_from_config(load_config(), accept_hooks=False)
         except Exception:
             logger.debug(
                 "shell-hook registration failed at gateway startup",

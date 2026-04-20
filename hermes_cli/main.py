@@ -5114,6 +5114,22 @@ For more help on a command:
                              help="Suppress all stderr log output")
     gateway_run.add_argument("--replace", action="store_true",
                              help="Replace any existing gateway instance (useful for systemd)")
+    gateway_run.add_argument(
+        "--accept-hooks",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "Auto-approve any unseen shell hooks declared in config.yaml "
+            "without a TTY prompt.  Equivalent to HERMES_ACCEPT_HOOKS=1 "
+            "or hooks_auto_accept: true in config.yaml."
+        ),
+    )
+    gateway_parser.add_argument(
+        "--accept-hooks",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="See `hermes gateway run --help` for --accept-hooks details.",
+    )
     
     # gateway start
     gateway_start = gateway_subparsers.add_parser("start", help="Start the installed systemd/launchd background service")
@@ -5352,6 +5368,15 @@ For more help on a command:
 
     cron_run = cron_subparsers.add_parser("run", help="Run a job on the next scheduler tick")
     cron_run.add_argument("job_id", help="Job ID to trigger")
+    cron_run.add_argument(
+        "--accept-hooks",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "Auto-approve any unseen shell hooks declared in config.yaml "
+            "without a TTY prompt."
+        ),
+    )
 
     cron_remove = cron_subparsers.add_parser("remove", aliases=["rm", "delete"], help="Remove a scheduled job")
     cron_remove.add_argument("job_id", help="Job ID to remove")
@@ -5360,8 +5385,23 @@ For more help on a command:
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")
 
     # cron tick (mostly for debugging)
-    cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
+    cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
+    cron_tick.add_argument(
+        "--accept-hooks",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "Auto-approve any unseen shell hooks declared in config.yaml "
+            "without a TTY prompt."
+        ),
+    )
 
+    cron_parser.add_argument(
+        "--accept-hooks",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="See `hermes cron run --help` for --accept-hooks details.",
+    )
     cron_parser.set_defaults(func=cmd_cron)
 
     # =========================================================================
@@ -5990,6 +6030,15 @@ Examples:
         "-v", "--verbose", action="store_true",
         help="Enable verbose logging on stderr",
     )
+    mcp_serve_p.add_argument(
+        "--accept-hooks",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "Auto-approve any unseen shell hooks declared in config.yaml "
+            "without a TTY prompt."
+        ),
+    )
 
     mcp_add_p = mcp_sub.add_parser("add", help="Add an MCP server (discovery-first install)")
     mcp_add_p.add_argument("name", help="Server name (used as config key)")
@@ -6016,6 +6065,13 @@ Examples:
         help="Force re-authentication for an OAuth-based MCP server",
     )
     mcp_login_p.add_argument("name", help="Server name to re-authenticate")
+
+    mcp_parser.add_argument(
+        "--accept-hooks",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="See `hermes mcp serve --help` for --accept-hooks details.",
+    )
 
     def cmd_mcp(args):
         from hermes_cli.mcp_config import mcp_command
@@ -6390,6 +6446,15 @@ Examples:
         help="Run Hermes Agent as an ACP (Agent Client Protocol) server",
         description="Start Hermes Agent in ACP mode for editor integration (VS Code, Zed, JetBrains)",
     )
+    acp_parser.add_argument(
+        "--accept-hooks",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "Auto-approve any unseen shell hooks declared in config.yaml "
+            "without a TTY prompt."
+        ),
+    )
 
     def cmd_acp(args):
         """Launch Hermes Agent as an ACP server."""
@@ -6617,17 +6682,34 @@ Examples:
     # side-effect), so non-agent commands never paid that cost; keep it
     # that way.
     #
-    # Cron only runs the agent loop on `cron run` (trigger a job) and
-    # `cron tick` (fire due jobs now).  The remaining cron subcommands
-    # (list, create, edit, pause, resume, remove, status) are DB-only
-    # and must not register hooks.
-    _AGENT_COMMANDS = {None, "chat", "gateway", "acp", "mcp", "rl"}
+    # Only the subcommands that actually invoke the agent loop need plugin
+    # discovery and shell-hook registration.  For subcommand groups with
+    # mixed CRUD/admin vs. agent-running entries we narrow by the nested
+    # subcommand:
+    #   cron    — `run` and `tick` run scheduled jobs; list/create/edit/
+    #             pause/resume/remove/status are DB-only.
+    #   gateway — only `run` starts the messaging gateway in-process;
+    #             start/stop/restart/status/install/uninstall/setup only
+    #             touch the service manager or disk.
+    #   mcp     — only `serve` runs Hermes as an MCP server; add/remove/
+    #             test/list/configure/login are configuration-only.
+    _AGENT_COMMANDS = {None, "chat", "acp", "rl"}
     _CRON_AGENT_SUBCOMMANDS = {"run", "tick"}
+    _GATEWAY_AGENT_SUBCOMMANDS = {"run"}
+    _MCP_AGENT_SUBCOMMANDS = {"serve"}
     _is_agent_command = (
         args.command in _AGENT_COMMANDS
         or (
             args.command == "cron"
             and getattr(args, "cron_command", None) in _CRON_AGENT_SUBCOMMANDS
+        )
+        or (
+            args.command == "gateway"
+            and getattr(args, "gateway_command", None) in _GATEWAY_AGENT_SUBCOMMANDS
+        )
+        or (
+            args.command == "mcp"
+            and getattr(args, "mcp_action", None) in _MCP_AGENT_SUBCOMMANDS
         )
     )
     if _is_agent_command:
