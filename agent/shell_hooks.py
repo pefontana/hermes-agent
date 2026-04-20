@@ -183,6 +183,12 @@ def register_from_config(
 
     for spec in specs:
         key = (spec.event, spec.matcher, spec.command)
+
+        # Check idempotence and allowlist status under the lock, but
+        # never hold the lock across the potentially-long TTY consent
+        # prompt.  Concurrent callers that block on a prompt would
+        # otherwise park other registration threads indefinitely even
+        # though they have nothing to do with this spec.
         with _registered_lock:
             if key in _registered:
                 logger.debug(
@@ -190,23 +196,31 @@ def register_from_config(
                     "skipping", spec.event, spec.matcher, spec.command,
                 )
                 continue
+            already_allowlisted = _is_allowlisted(spec.event, spec.command)
 
-            if not _is_allowlisted(spec.event, spec.command):
-                approved = _prompt_and_record(
+        if not already_allowlisted:
+            approved = _prompt_and_record(
+                spec.event, spec.command,
+                accept_hooks=effective_accept,
+            )
+            if not approved:
+                logger.warning(
+                    "shell hook for %s (command: %s) is not allowlisted — "
+                    "registration skipped.  Re-run with --accept-hooks / "
+                    "set HERMES_ACCEPT_HOOKS=1 / hooks_auto_accept: true "
+                    "in config.yaml, or approve interactively at the TTY "
+                    "prompt on the next run.",
                     spec.event, spec.command,
-                    accept_hooks=effective_accept,
                 )
-                if not approved:
-                    logger.warning(
-                        "shell hook for %s (command: %s) is not allowlisted — "
-                        "registration skipped.  Run `hermes hooks list` to "
-                        "see pending hooks, or re-run with --accept-hooks / "
-                        "set HERMES_ACCEPT_HOOKS=1 / hooks_auto_accept: true "
-                        "in config.yaml.",
-                        spec.event, spec.command,
-                    )
-                    continue
+                continue
 
+        with _registered_lock:
+            # Defensive re-check — registration is single-threaded at
+            # every in-tree call site today, but if a future caller
+            # parallelised it, two threads that both cleared the prompt
+            # would otherwise double-register the same callback.
+            if key in _registered:
+                continue
             callback = _make_callback(spec)
             manager._hooks.setdefault(spec.event, []).append(callback)
             _registered.add(key)
