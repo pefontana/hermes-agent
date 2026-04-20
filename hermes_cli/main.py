@@ -6609,14 +6609,28 @@ Examples:
     # logged but never block the CLI.
     #
     # Gated to commands that actually run the agent.  Introspection-only
-    # commands (hermes hooks list, version, doctor, ...) would otherwise
-    # pay plugin-discovery cost and trigger plugin register() side
-    # effects — and shell-hook registration would prompt for consent on
-    # un-allowlisted hooks the user is still inspecting.  Pre-PR plugin
-    # discovery was lazy (via model_tools import side-effect), so
-    # non-agent commands never paid that cost; keep it that way.
-    _AGENT_COMMANDS = {None, "chat", "gateway", "acp", "mcp", "cron", "rl"}
-    if args.command in _AGENT_COMMANDS:
+    # commands (hermes hooks list, version, doctor, cron list/status/...)
+    # would otherwise pay plugin-discovery cost and trigger plugin
+    # register() side effects — and shell-hook registration would prompt
+    # for consent on un-allowlisted hooks the user is still inspecting.
+    # Pre-PR plugin discovery was lazy (via model_tools import
+    # side-effect), so non-agent commands never paid that cost; keep it
+    # that way.
+    #
+    # Cron only runs the agent loop on `cron run` (trigger a job) and
+    # `cron tick` (fire due jobs now).  The remaining cron subcommands
+    # (list, create, edit, pause, resume, remove, status) are DB-only
+    # and must not register hooks.
+    _AGENT_COMMANDS = {None, "chat", "gateway", "acp", "mcp", "rl"}
+    _CRON_AGENT_SUBCOMMANDS = {"run", "tick"}
+    _is_agent_command = (
+        args.command in _AGENT_COMMANDS
+        or (
+            args.command == "cron"
+            and getattr(args, "cron_command", None) in _CRON_AGENT_SUBCOMMANDS
+        )
+    )
+    if _is_agent_command:
         _accept_hooks = bool(getattr(args, "accept_hooks", False))
         try:
             from hermes_cli.plugins import discover_plugins
