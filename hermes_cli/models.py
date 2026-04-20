@@ -230,6 +230,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "trinity-mini",
     ],
     "opencode-zen": [
+        "kimi-k2.6",
         "kimi-k2.5",
         "gpt-5.4-pro",
         "gpt-5.4",
@@ -267,6 +268,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "big-pickle",
     ],
     "opencode-go": [
+        "kimi-k2.6",
         "kimi-k2.5",
         "glm-5.1",
         "glm-5",
@@ -302,6 +304,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # to https://dashscope-intl.aliyuncs.com/compatible-mode/v1 (OpenAI-compat)
     # or https://dashscope-intl.aliyuncs.com/apps/anthropic (Anthropic-compat).
     "alibaba": [
+        "kimi-k2.6",
         "kimi-k2.5",
         "qwen3.5-plus",
         "qwen3-coder-plus",
@@ -313,6 +316,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     # Curated HF model list — only agentic models that map to OpenRouter defaults.
     "huggingface": [
+        "moonshotai/Kimi-K2.6",
         "moonshotai/Kimi-K2.5",
         "Qwen/Qwen3.5-397B-A17B",
         "Qwen/Qwen3.5-35B-A3B",
