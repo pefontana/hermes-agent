@@ -640,6 +640,24 @@ class TestAllowlistConcurrency:
         assert "No space" in msg
         assert "re-prompt" in msg
 
+    def test_script_is_executable_handles_interpreter_prefix(self, tmp_path):
+        """For ``python3 hook.py`` and similar the interpreter reads
+        the script, so X_OK on the script itself is not required —
+        only R_OK.  Bare invocations still require X_OK."""
+        script = tmp_path / "hook.py"
+        script.write_text("print()\n")  # readable, NOT executable
+
+        # Interpreter prefix: R_OK is enough.
+        assert shell_hooks.script_is_executable(f"python3 {script}")
+        assert shell_hooks.script_is_executable(f"/usr/bin/env python3 {script}")
+
+        # Bare invocation on the same non-X_OK file: not runnable.
+        assert not shell_hooks.script_is_executable(str(script))
+
+        # Flip +x; bare invocation is now runnable too.
+        script.chmod(0o755)
+        assert shell_hooks.script_is_executable(str(script))
+
     def test_command_script_path_resolution(self):
         """Regression: ``_command_script_path`` used to return the first
         shlex token, which picked the interpreter (``python3``, ``bash``,

@@ -789,15 +789,26 @@ def script_mtime_iso(command: str) -> Optional[str]:
 
 
 def script_is_executable(command: str) -> bool:
-    """Return ``True`` iff the first token of ``command`` resolves to an
-    executable file on disk."""
+    """Return ``True`` iff ``command`` is runnable as configured.
+
+    For a bare invocation (``/path/hook.sh``) the script itself must be
+    executable.  For interpreter-prefixed commands (``python3
+    /path/hook.py``, ``/usr/bin/env bash hook.sh``) the script just has
+    to be readable — the interpreter doesn't care about the ``X_OK``
+    bit.  Mirrors what ``_spawn`` would actually do at runtime."""
     path = _command_script_path(command)
     if not path:
         return False
     expanded = os.path.expanduser(path)
     if not os.path.isfile(expanded):
         return False
-    return os.access(expanded, os.X_OK)
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    is_bare_invocation = bool(argv) and argv[0] == path
+    required = os.X_OK if is_bare_invocation else os.R_OK
+    return os.access(expanded, required)
 
 
 def run_once(
