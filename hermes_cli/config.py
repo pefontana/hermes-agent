@@ -691,6 +691,12 @@ DEFAULT_CONFIG = {
                                # independent of the parent's max_iterations)
         "reasoning_effort": "",  # reasoning effort for subagents: "xhigh", "high", "medium",
                                  # "low", "minimal", "none" (empty = inherit parent's level)
+        "max_concurrent_children": 5,  # max parallel children per batch; clamped to [1, 8]
+        # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
+        # and _get_orchestrator_enabled).  Values are clamped to [1, 3] with a
+        # warning log if out of range.
+        "max_spawn_depth": 2,        # depth cap (1 = flat, 2 = orchestrator→leaf, 3 = three-level)
+        "orchestrator_enabled": True,  # kill switch for role="orchestrator"
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -796,6 +802,11 @@ DEFAULT_CONFIG = {
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,
+        # Maximum number of due jobs to run in parallel per tick.
+        # null/0 = unbounded (limited only by thread count).
+        # 1 = serial (pre-v0.9 behaviour).
+        # Also overridable via HERMES_CRON_MAX_PARALLEL env var.
+        "max_parallel_jobs": None,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

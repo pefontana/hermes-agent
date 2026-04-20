@@ -216,8 +216,8 @@ Restricting toolsets keeps the subagent focused and prevents accidental side eff
 
 ## Constraints
 
-- **Default 3 parallel tasks** — batches default to 3 concurrent subagents (configurable via `delegation.max_concurrent_children` in config.yaml)
-- **No nesting** — subagents cannot call `delegate_task`, `clarify`, `memory`, `send_message`, or `execute_code`
+- **Default 5 parallel tasks (max 8)** — batches default to 5 concurrent subagents (configurable via `delegation.max_concurrent_children` in config.yaml, capped at 8)
+- **Nested delegation is opt-in** — leaf subagents (default) cannot call `delegate_task`, `clarify`, `memory`, `send_message`, or `execute_code`. Orchestrator subagents (`role="orchestrator"`) retain `delegate_task` for further delegation, bounded by `delegation.max_spawn_depth` (1-3, default 2); the other four remain blocked. Disable globally via `delegation.orchestrator_enabled: false`.
 - **Separate terminals** — each subagent gets its own terminal session with separate working directory and state
 - **No conversation history** — subagents see only what you put in `goal` and `context`
 - **Default 50 iterations** — set `max_iterations` lower for simple tasks to save cost
