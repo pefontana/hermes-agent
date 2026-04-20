@@ -278,6 +278,7 @@ class TestDelegateTask(unittest.TestCase):
                 model=None,
                 max_iterations=10,
                 parent_agent=parent,
+                task_count=1,
             )
 
         self.assertIs(mock_child._print_fn, sink)
@@ -298,6 +299,7 @@ class TestDelegateTask(unittest.TestCase):
                 model=None,
                 max_iterations=10,
                 parent_agent=parent,
+                task_count=1,
             )
 
         self.assertTrue(callable(mock_child.thinking_callback))
@@ -367,6 +369,7 @@ class TestToolNamePreservation(unittest.TestCase):
                     model=None,
                     max_iterations=10,
                     parent_agent=parent,
+                    task_count=1,
                 )
             except NameError as exc:
                 self.fail(
@@ -1012,6 +1015,7 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
                 model=None,
                 max_iterations=10,
                 parent_agent=parent,
+                task_count=1,
             )
 
             self.assertEqual(mock_child._credential_pool, mock_pool)
@@ -1237,6 +1241,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         _build_child_agent(
             task_index=0, goal="test", context=None, toolsets=None,
             model=None, max_iterations=50, parent_agent=parent,
+            task_count=1,
         )
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
@@ -1253,6 +1258,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         _build_child_agent(
             task_index=0, goal="test", context=None, toolsets=None,
             model=None, max_iterations=50, parent_agent=parent,
+            task_count=1,
         )
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
@@ -1269,6 +1275,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         _build_child_agent(
             task_index=0, goal="test", context=None, toolsets=None,
             model=None, max_iterations=50, parent_agent=parent,
+            task_count=1,
         )
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": False})
@@ -1285,6 +1292,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         _build_child_agent(
             task_index=0, goal="test", context=None, toolsets=None,
             model=None, max_iterations=50, parent_agent=parent,
+            task_count=1,
         )
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
@@ -1352,7 +1360,7 @@ class TestDelegateEventEnum(unittest.TestCase):
         parent._delegate_spinner = MagicMock()
         parent.tool_progress_callback = MagicMock()
 
-        cb = _build_child_progress_callback(0, parent, task_count=1)
+        cb = _build_child_progress_callback(0, "test goal", parent, task_count=1)
         self.assertIsNotNone(cb)
 
         cb("tool.started", tool_name="terminal", preview="ls")
@@ -1364,7 +1372,7 @@ class TestDelegateEventEnum(unittest.TestCase):
         parent._delegate_spinner = MagicMock()
         parent.tool_progress_callback = None
 
-        cb = _build_child_progress_callback(0, parent, task_count=1)
+        cb = _build_child_progress_callback(0, "test goal", parent, task_count=1)
 
         cb("_thinking", tool_name=None, preview="pondering...")
         assert any("💭" in str(c) for c in parent._delegate_spinner.print_above.call_args_list)
@@ -1379,7 +1387,7 @@ class TestDelegateEventEnum(unittest.TestCase):
         parent._delegate_spinner = MagicMock()
         parent.tool_progress_callback = None
 
-        cb = _build_child_progress_callback(0, parent, task_count=1)
+        cb = _build_child_progress_callback(0, "test goal", parent, task_count=1)
         cb("tool.completed", tool_name="terminal")
         parent._delegate_spinner.print_above.assert_not_called()
 
@@ -1388,7 +1396,7 @@ class TestDelegateEventEnum(unittest.TestCase):
         parent = _make_mock_parent()
         parent._delegate_spinner = MagicMock()
 
-        cb = _build_child_progress_callback(0, parent, task_count=1)
+        cb = _build_child_progress_callback(0, "test goal", parent, task_count=1)
         # Should not raise
         cb("some.unknown.event", tool_name="x")
         parent._delegate_spinner.print_above.assert_not_called()
@@ -1401,7 +1409,7 @@ class TestDelegateEventEnum(unittest.TestCase):
         parent._delegate_spinner = MagicMock()
         parent.tool_progress_callback = None
 
-        cb = _build_child_progress_callback(0, parent, task_count=1)
+        cb = _build_child_progress_callback(0, "test goal", parent, task_count=1)
         cb(DelegateEvent.TASK_THINKING, preview="pondering")
         # If the enum was accepted, the thinking emoji got printed.
         assert any(
@@ -1416,7 +1424,7 @@ class TestDelegateEventEnum(unittest.TestCase):
         parent = _make_mock_parent()
         parent._delegate_spinner = MagicMock()
 
-        cb = _build_child_progress_callback(0, parent, task_count=1)
+        cb = _build_child_progress_callback(0, "test goal", parent, task_count=1)
         cb("delegate.task_thinking", preview="hmm")
         assert any(
             "💭" in str(c)
@@ -1439,7 +1447,7 @@ class TestDelegateEventEnum(unittest.TestCase):
         parent._delegate_spinner = MagicMock()
         parent.tool_progress_callback = MagicMock()
 
-        cb = _build_child_progress_callback(0, parent, task_count=1)
+        cb = _build_child_progress_callback(0, "test goal", parent, task_count=1)
         cb("subagent_progress", tool_name="🔀 [1] terminal, file")
 
         # Spinner gets a distinct 🔀-prefixed line, NOT a tool emoji

@@ -80,6 +80,7 @@ export const en: Translations = {
     notRunning: "Not running",
     startFailed: "Start failed",
     pid: "PID",
+    runningRemote: "Running (remote)",
     noneRunning: "None",
     gatewayFailedToStart: "Gateway failed to start",
     lastUpdate: "Last update",
@@ -114,6 +115,11 @@ export const en: Translations = {
     dailyTokenUsage: "Daily Token Usage",
     dailyBreakdown: "Daily Breakdown",
     perModelBreakdown: "Per-Model Breakdown",
+    topSkills: "Top Skills",
+    skill: "Skill",
+    loads: "Agent Loaded",
+    edits: "Agent Managed",
+    lastUsed: "Last Used",
     input: "Input",
     output: "Output",
     total: "Total",
@@ -273,5 +279,10 @@ export const en: Translations = {
 
   language: {
     switchTo: "Switch to Chinese",
+  },
+
+  theme: {
+    title: "Theme",
+    switchTheme: "Switch theme",
   },
 };

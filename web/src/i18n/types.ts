@@ -83,6 +83,7 @@ export interface Translations {
     notRunning: string;
     startFailed: string;
     pid: string;
+    runningRemote: string;
     noneRunning: string;
     gatewayFailedToStart: string;
     lastUpdate: string;
@@ -119,6 +120,11 @@ export interface Translations {
     dailyTokenUsage: string;
     dailyBreakdown: string;
     perModelBreakdown: string;
+    topSkills: string;
+    skill: string;
+    loads: string;
+    edits: string;
+    lastUsed: string;
     input: string;
     output: string;
     total: string;
@@ -285,5 +291,11 @@ export interface Translations {
   // ── Language switcher ──
   language: {
     switchTo: string;
+  };
+
+  // ── Theme switcher ──
+  theme: {
+    title: string;
+    switchTheme: string;
   };
 }
