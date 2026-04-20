@@ -243,3 +243,26 @@ class TestHooksDoctor:
         with patch("hermes_cli.config.load_config", return_value=cfg):
             out = _run(SimpleNamespace(hooks_action="doctor"))
         assert "All shell hooks look healthy" in out
+
+    def test_unallowlisted_script_is_not_executed(self, tmp_path):
+        """Regression for M4: `hermes hooks doctor` used to run every
+        listed script against a synthetic payload as part of its JSON
+        smoke test, which contradicted the documented workflow of
+        "spot newly-added hooks *before they register*".  An un-allowlisted
+        script must not be executed during `doctor`."""
+        sentinel = tmp_path / "executed"
+        # Script would touch the sentinel if executed; we assert it wasn't.
+        script = _hook_script(
+            tmp_path,
+            f"#!/usr/bin/env bash\ntouch {sentinel}\nprintf '{{}}\\n'\n",
+        )
+        cfg = {"hooks": {"on_session_start": [{"command": str(script)}]}}
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = _run(SimpleNamespace(hooks_action="doctor"))
+
+        assert not sentinel.exists(), (
+            "doctor executed an un-allowlisted script — "
+            "M4 gate regressed"
+        )
+        assert "not allowlisted" in out.lower()
+        assert "skipped JSON smoke test" in out

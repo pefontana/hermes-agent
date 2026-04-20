@@ -316,8 +316,16 @@ def _doctor_one(spec, shell_hooks) -> int:
         elif mtime_now and mtime_at and mtime_now == mtime_at:
             print("      ✓ script unchanged since approval")
 
-    # 4. Produces valid JSON for a synthetic payload (only if executable)
-    if shell_hooks.script_is_executable(spec.command):
+    # 4. Produces valid JSON for a synthetic payload — only when the entry
+    # is already allowlisted.  Otherwise `hermes hooks doctor` would execute
+    # every script listed in a freshly-pulled config before the user has
+    # reviewed them, which directly contradicts the documented workflow
+    # ("spot newly-added hooks *before they register*").
+    if not entry:
+        print("      ℹ skipped JSON smoke test — not allowlisted yet. "
+              "Approve the hook first (via TTY prompt or --accept-hooks), "
+              "then re-run `hermes hooks doctor`.")
+    elif shell_hooks.script_is_executable(spec.command):
         payload = _DEFAULT_PAYLOADS.get(spec.event, {"extra": {}})
         result = shell_hooks.run_once(spec, payload)
         if result.get("timed_out"):
