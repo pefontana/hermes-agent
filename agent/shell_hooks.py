@@ -61,12 +61,19 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+
+try:
+    import fcntl  # POSIX only; Windows falls back to best-effort without flock.
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 from hermes_constants import get_hermes_home
 
@@ -84,6 +91,14 @@ ALLOWLIST_FILENAME = "shell-hooks-allowlist.json"
 # so the CLI and gateway can both call register_from_config() safely.
 _registered: Set[Tuple[str, Optional[str], str]] = set()
 _registered_lock = threading.Lock()
+
+# Intra-process lock for allowlist read-modify-write on platforms that
+# lack ``fcntl`` (non-POSIX).  Kept separate from ``_registered_lock``
+# because ``register_from_config`` already holds ``_registered_lock`` when
+# it triggers ``_record_approval`` — reusing it here would self-deadlock
+# (``threading.Lock`` is non-reentrant).  POSIX callers use the sibling
+# ``.lock`` file via ``fcntl.flock`` and bypass this.
+_allowlist_write_lock = threading.Lock()
 
 
 @dataclass
@@ -530,16 +545,32 @@ def load_allowlist() -> Dict[str, Any]:
 
 
 def save_allowlist(data: Dict[str, Any]) -> None:
-    """Persist the allowlist atomically.  Uses tmp + os.replace so a
-    concurrent reader or a process killed mid-write never sees truncated
-    JSON.  Silently no-ops on OSError — the caller already logged the
-    broader context."""
+    """Persist the allowlist atomically.  Each writer uses a per-process
+    unique temp file (``tempfile.mkstemp`` in the same directory) so two
+    concurrent writers cannot ``os.replace`` each other's temp file out
+    from under them — prior versions used a fixed ``…allowlist.json.tmp``
+    path which produced ``ENOENT`` under contention.  Silently no-ops on
+    OSError — the caller already logged broader context.
+
+    Read-modify-write races (two processes both reading the file, each
+    appending an approval, second write overwrites the first) are handled
+    by :func:`_locked_update_approvals` via ``fcntl.flock``."""
     p = allowlist_path()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(p.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-        os.replace(tmp, p)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f"{p.name}.", suffix=".tmp", dir=str(p.parent),
+        )
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(json.dumps(data, indent=2, sort_keys=True))
+            os.replace(tmp_path, p)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
     except OSError as exc:
         logger.warning("Failed to write shell hook allowlist: %s", exc)
 
@@ -552,6 +583,37 @@ def _is_allowlisted(event: str, command: str) -> bool:
         and e.get("command") == command
         for e in data.get("approvals", [])
     )
+
+
+@contextmanager
+def _locked_update_approvals() -> Iterator[Dict[str, Any]]:
+    """Serialise read-modify-write on the allowlist across processes.
+
+    Holds an exclusive ``flock`` on a sibling lock file for the duration
+    of the update so concurrent ``_record_approval``/``revoke`` callers
+    cannot clobber each other's changes (the race Codex reproduced with
+    20–50 simultaneous writers).  Falls back to an in-process lock on
+    platforms without ``fcntl``.
+    """
+    p = allowlist_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = p.with_suffix(p.suffix + ".lock")
+
+    if fcntl is None:  # pragma: no cover — non-POSIX fallback
+        with _allowlist_write_lock:
+            data = load_allowlist()
+            yield data
+            save_allowlist(data)
+        return
+
+    with open(lock_path, "a+") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            data = load_allowlist()
+            yield data
+            save_allowlist(data)
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
 
 def _prompt_and_record(
@@ -593,22 +655,21 @@ def _prompt_and_record(
 
 
 def _record_approval(event: str, command: str) -> None:
-    data = load_allowlist()
     entry = {
         "event": event,
         "command": command,
         "approved_at": _utc_now_iso(),
         "script_mtime_at_approval": script_mtime_iso(command),
     }
-    data["approvals"] = [
-        e for e in data.get("approvals", [])
-        if not (
-            isinstance(e, dict)
-            and e.get("event") == event
-            and e.get("command") == command
-        )
-    ] + [entry]
-    save_allowlist(data)
+    with _locked_update_approvals() as data:
+        data["approvals"] = [
+            e for e in data.get("approvals", [])
+            if not (
+                isinstance(e, dict)
+                and e.get("event") == event
+                and e.get("command") == command
+            )
+        ] + [entry]
 
 
 def _utc_now_iso() -> str:
@@ -622,14 +683,14 @@ def revoke(command: str) -> int:
     callbacks that are already live on the plugin manager in the current
     process — restart the CLI / gateway to drop them.
     """
-    data = load_allowlist()
-    before = len(data.get("approvals", []))
-    data["approvals"] = [
-        e for e in data.get("approvals", [])
-        if not (isinstance(e, dict) and e.get("command") == command)
-    ]
-    save_allowlist(data)
-    return before - len(data["approvals"])
+    with _locked_update_approvals() as data:
+        before = len(data.get("approvals", []))
+        data["approvals"] = [
+            e for e in data.get("approvals", [])
+            if not (isinstance(e, dict) and e.get("command") == command)
+        ]
+        after = len(data["approvals"])
+    return before - after
 
 
 def _command_script_path(command: str) -> str:

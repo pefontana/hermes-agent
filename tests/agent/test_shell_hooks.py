@@ -522,3 +522,108 @@ class TestIdempotentRegistration:
         assert len(registered) == 2
         mgr = plugins.get_plugin_manager()
         assert len(mgr._hooks.get("pre_tool_call", [])) == 2
+
+
+# ── Allowlist concurrency ─────────────────────────────────────────────────
+
+
+class TestAllowlistConcurrency:
+    """Regression tests for the Codex#1 finding: simultaneous
+    _record_approval() calls used to collide on a fixed tmp path and
+    silently lose entries under read-modify-write races."""
+
+    def test_parallel_record_approval_does_not_lose_entries(
+        self, tmp_path, monkeypatch,
+    ):
+        import threading
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+        N = 32
+        barrier = threading.Barrier(N)
+        errors: list = []
+
+        def worker(i: int) -> None:
+            try:
+                barrier.wait(timeout=5)
+                shell_hooks._record_approval(
+                    "on_session_start", f"/bin/hook-{i}.sh",
+                )
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(N)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"worker errors: {errors}"
+
+        data = shell_hooks.load_allowlist()
+        commands = {e["command"] for e in data["approvals"]}
+        assert commands == {f"/bin/hook-{i}.sh" for i in range(N)}, (
+            f"expected all {N} entries, got {len(commands)}"
+        )
+
+    def test_non_posix_fallback_does_not_self_deadlock(
+        self, tmp_path, monkeypatch,
+    ):
+        """Regression: on platforms without fcntl, the fallback lock must
+        be separate from _registered_lock.  register_from_config holds
+        _registered_lock while calling _record_approval (via the consent
+        prompt path), so a shared non-reentrant lock would self-deadlock."""
+        import threading
+
+        monkeypatch.setattr(shell_hooks, "fcntl", None)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+        completed = threading.Event()
+        errors: list = []
+
+        def target() -> None:
+            try:
+                with shell_hooks._registered_lock:
+                    shell_hooks._record_approval(
+                        "on_session_start", "/bin/x.sh",
+                    )
+                completed.set()
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+                completed.set()
+
+        t = threading.Thread(target=target, daemon=True)
+        t.start()
+        if not completed.wait(timeout=3.0):
+            pytest.fail(
+                "non-POSIX fallback self-deadlocked — "
+                "_locked_update_approvals must not reuse _registered_lock",
+            )
+        t.join(timeout=1.0)
+        assert not errors, f"errors: {errors}"
+        assert shell_hooks._is_allowlisted(
+            "on_session_start", "/bin/x.sh",
+        )
+
+    def test_save_allowlist_uses_unique_tmp_paths(self, tmp_path, monkeypatch):
+        """Two save_allowlist calls in flight must use distinct tmp files
+        so the loser's os.replace does not ENOENT on the winner's sweep."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        p = shell_hooks.allowlist_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+        tmp_paths_seen: list = []
+        real_mkstemp = shell_hooks.tempfile.mkstemp
+
+        def spying_mkstemp(*args, **kwargs):
+            fd, path = real_mkstemp(*args, **kwargs)
+            tmp_paths_seen.append(path)
+            return fd, path
+
+        monkeypatch.setattr(shell_hooks.tempfile, "mkstemp", spying_mkstemp)
+
+        shell_hooks.save_allowlist({"approvals": [{"event": "a", "command": "x"}]})
+        shell_hooks.save_allowlist({"approvals": [{"event": "b", "command": "y"}]})
+
+        assert len(tmp_paths_seen) == 2
+        assert tmp_paths_seen[0] != tmp_paths_seen[1]
