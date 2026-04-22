@@ -182,6 +182,24 @@ _DEFAULT_PAYLOADS = {
         "child_status": "completed",
         "duration_ms": 1234,
     },
+    "subagent_batch_complete": {
+        "parent_session_id": "parent-sess",
+        "child_count": 3,
+        "completed_count": 2,
+        "failed_count": 0,
+        "errored_count": 0,
+        "interrupted_count": 1,
+        "timeout_count": 0,
+        "total_duration_ms": 5000,
+        "children": [
+            {"task_index": 0, "role": None, "status": "completed",
+             "duration_ms": 1200, "summary": "Task 0 summary"},
+            {"task_index": 1, "role": None, "status": "completed",
+             "duration_ms": 1800, "summary": "Task 1 summary"},
+            {"task_index": 2, "role": None, "status": "interrupted",
+             "duration_ms": 500, "summary": None},
+        ],
+    },
 }
 
 
