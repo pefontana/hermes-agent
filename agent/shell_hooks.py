@@ -147,14 +147,15 @@ _async_init_lock = threading.Lock()
 _async_shutting_down = False
 _async_atexit_registered = False
 
-# SIGINT chaining state: only CLI-mode installs a handler (the gateway
-# owns its own asyncio-native handler, see gateway/run.py).
-# ``_sigint_handler_owned_by_us`` is true only after
-# ``_maybe_install_sigint_handler`` actually swapped the handler — tests
-# that set ``_sigint_handler_installed`` manually don't flip it, so
+# Signal chaining state: only CLI-mode installs handlers (the gateway
+# owns its own asyncio-native handlers, see gateway/run.py).
+# ``_signal_handlers_owned_by_us`` is true only after
+# ``_maybe_install_signal_handlers`` actually swapped them — tests that
+# set ``_sigint_handler_installed`` manually don't flip it, so
 # ``_reset_async_pool`` won't restore a handler the module never owned
 # back onto the test runner's signal disposition.
 _original_sigint_handler: Any = None
+_original_sigterm_handler: Any = None
 _sigint_handler_installed = False
 _sigint_handler_owned_by_us = False
 
@@ -458,6 +459,37 @@ def _unregister_live_proc(proc: subprocess.Popen) -> None:
         _live_procs.discard(proc)
 
 
+def _terminate_group(proc: subprocess.Popen) -> None:
+    """Send SIGTERM to the subprocess's entire process group.
+
+    Hooks are spawned with ``start_new_session=True`` so the
+    subprocess is the leader of a fresh PGID; orphaned grandchildren
+    (e.g. a bash script's ``sleep``) would otherwise keep the parent
+    stdout FD open and block ``proc.communicate``.  ``killpg`` on the
+    group cascades SIGTERM to every descendant.  Falls back to a plain
+    ``terminate`` on platforms / edge cases where ``getpgid`` fails
+    (e.g. the proc already exited)."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Same as :func:`_terminate_group` but with SIGKILL, for
+    subprocesses that didn't honor SIGTERM within the grace window."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def _register_future(fut: concurrent.futures.Future) -> None:
     with _async_tracking_lock:
         _live_futures.add(fut)
@@ -605,8 +637,18 @@ def _run_async_body(spec: ShellHookSpec, payload: str) -> None:
             spec.event, spec.command, stderr[:400],
         )
     rc = r.get("returncode")
+    # During shutdown we SIGTERM every tracked child ourselves, so a
+    # negative return code (-SIGTERM = -15, -SIGKILL = -9) is expected
+    # and not a hook-author failure.  Demote to DEBUG in that case so
+    # the normal shutdown path doesn't emit a pool-sized burst of WARN.
     if rc not in (0, None):
-        logger.warning(
+        level = (
+            logging.DEBUG
+            if _async_shutting_down and rc is not None and rc < 0
+            else logging.WARNING
+        )
+        logger.log(
+            level,
             "async shell hook exited %d (event=%s command=%s); stderr=%s",
             rc, spec.event, spec.command, stderr[:400],
         )
@@ -653,10 +695,7 @@ def shutdown_async_hooks(grace_seconds: Optional[float] = None) -> None:
     with _async_tracking_lock:
         procs = list(_live_procs)
     for proc in procs:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+        _terminate_group(proc)
 
     deadline = time.monotonic() + max(0.0, float(grace_seconds))
     for proc in procs:
@@ -664,19 +703,16 @@ def shutdown_async_hooks(grace_seconds: Optional[float] = None) -> None:
         try:
             proc.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
+            _kill_group(proc)
             try:
-                proc.kill()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
-                logger.warning(
-                    "async shell hook subprocess exceeded shutdown grace "
-                    "(%.1fs) — killed pid=%d",
-                    grace_seconds, proc.pid,
-                )
-            except Exception:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
                 pass
+            logger.warning(
+                "async shell hook subprocess exceeded shutdown grace "
+                "(%.1fs) — killed pid=%d",
+                grace_seconds, proc.pid,
+            )
 
     if pool is not None:
         try:
@@ -691,17 +727,20 @@ def _async_pool_sigint_handler(signum, frame):
     handler so ``KeyboardInterrupt`` propagation still happens.
 
     Installed only by CLI-mode callers (see
-    ``_maybe_install_sigint_handler``); the gateway integrates
+    ``_maybe_install_signal_handlers``); the gateway integrates
     ``shutdown_async_hooks`` into its asyncio shutdown sequence
     instead.
     """
+    global _async_shutting_down
+    # Flip the flag so workers whose subprocesses we're about to
+    # SIGTERM log at DEBUG rather than WARN (the negative exit code
+    # is expected on a Ctrl-C).
+    _async_shutting_down = True
+
     with _async_tracking_lock:
         procs = list(_live_procs)
     for proc in procs:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+        _terminate_group(proc)
 
     handler = _original_sigint_handler
     if handler in (signal.SIG_DFL, signal.SIG_IGN, None):
@@ -709,30 +748,82 @@ def _async_pool_sigint_handler(signum, frame):
     handler(signum, frame)
 
 
-def _maybe_install_sigint_handler() -> None:
-    """Install the CLI async-hook SIGINT handler exactly once.
+def _async_pool_sigterm_handler(signum, frame):
+    """CLI-mode SIGTERM handler: terminate tracked subprocesses
+    *inline* so their worker threads unblock, then ``sys.exit`` so
+    Python still runs the atexit chain.
+
+    Without the inline terminate, atexit would not fire for the life
+    of every in-flight hook: the ``ThreadPoolExecutor`` uses
+    non-daemon threads, so Python waits for every worker to return
+    before running atexit.  Workers block inside
+    ``proc.communicate(timeout=spec.timeout)`` until the subprocess
+    exits — up to 300 seconds for a slow webhook — which defeats the
+    whole point of SIGTERM-as-graceful-shutdown.
+
+    Chains to the previous SIGTERM handler if one was installed.
+    Gateways install their own SIGTERM handler on the asyncio loop,
+    so this path is CLI-only.
+    """
+    global _async_shutting_down
+    # Same flag-flip as the SIGINT handler: demote the workers'
+    # exit-code logs to DEBUG during a signal-initiated shutdown.
+    _async_shutting_down = True
+
+    with _async_tracking_lock:
+        procs = list(_live_procs)
+    for proc in procs:
+        _terminate_group(proc)
+
+    handler = _original_sigterm_handler
+    if handler not in (signal.SIG_DFL, signal.SIG_IGN, None):
+        handler(signum, frame)
+    # SystemExit runs the atexit chain, which includes
+    # shutdown_async_hooks().  128 + signal number matches shell
+    # convention for signal-initiated exits.
+    sys.exit(128 + signal.SIGTERM)
+
+
+def _maybe_install_signal_handlers() -> None:
+    """Install the CLI async-hook SIGINT + SIGTERM handlers once.
 
     Only the CLI entry point calls this; the gateway owns its own
     asyncio-native signal disposition.  Wrapped in try/except so
     non-main-thread callers degrade to atexit-only (``signal.signal``
     raises ``ValueError`` off the main thread).
+
+    The SIGINT handler terminates tracked subprocesses and chains to
+    the original handler so ``KeyboardInterrupt`` propagation works.
+    The SIGTERM handler calls ``sys.exit`` so Python's atexit chain
+    runs — without this, SIGTERM (from ``kill``, ``timeout``, systemd
+    stop, CI harnesses) skips atexit and orphans every in-flight hook
+    subprocess.
     """
-    global _original_sigint_handler, _sigint_handler_installed
-    global _sigint_handler_owned_by_us
+    global _original_sigint_handler, _original_sigterm_handler
+    global _sigint_handler_installed, _sigint_handler_owned_by_us
     if _sigint_handler_installed:
         return
     try:
         _original_sigint_handler = signal.signal(
             signal.SIGINT, _async_pool_sigint_handler,
         )
+        _original_sigterm_handler = signal.signal(
+            signal.SIGTERM, _async_pool_sigterm_handler,
+        )
         _sigint_handler_installed = True
         _sigint_handler_owned_by_us = True
     except (ValueError, OSError):
         logger.debug(
-            "SIGINT handler not installed for async hooks (not main "
+            "signal handlers not installed for async hooks (not main "
             "thread); relying on atexit shutdown + "
             "hooks_async_shutdown_grace_seconds",
         )
+
+
+# Back-compat alias for the old name (kept so any out-of-tree caller
+# that imported it still works; the CLI has been switched to the new
+# name in the same commit).
+_maybe_install_sigint_handler = _maybe_install_signal_handlers
 
 
 def _reset_async_pool() -> None:
@@ -744,8 +835,8 @@ def _reset_async_pool() -> None:
     next test sees stale singletons and leaked subprocesses.
     """
     global _async_pool_inst, _async_sem_inst, _async_shutting_down
-    global _original_sigint_handler, _sigint_handler_installed
-    global _sigint_handler_owned_by_us
+    global _original_sigint_handler, _original_sigterm_handler
+    global _sigint_handler_installed, _sigint_handler_owned_by_us
 
     if _async_pool_inst is not None or _live_procs:
         try:
@@ -761,18 +852,25 @@ def _reset_async_pool() -> None:
     _async_sem_inst = None
     _async_shutting_down = False
 
-    # Only restore a SIGINT handler we actually installed ourselves —
+    # Only restore signal handlers we actually installed ourselves —
     # tests that flip ``_sigint_handler_installed`` manually (to
     # exercise ``_async_pool_sigint_handler`` without running
-    # ``_maybe_install_sigint_handler``) haven't mutated the process's
-    # real signal disposition, so we must not write a fake handler
-    # back into it.
-    if _sigint_handler_owned_by_us and _original_sigint_handler is not None:
-        try:
-            signal.signal(signal.SIGINT, _original_sigint_handler)
-        except (ValueError, OSError):
-            pass
+    # ``_maybe_install_signal_handlers``) haven't mutated the
+    # process's real signal disposition, so we must not write a fake
+    # handler back into it.
+    if _sigint_handler_owned_by_us:
+        for sig, previous in (
+            (signal.SIGINT, _original_sigint_handler),
+            (signal.SIGTERM, _original_sigterm_handler),
+        ):
+            if previous is None:
+                continue
+            try:
+                signal.signal(sig, previous)
+            except (ValueError, OSError):
+                pass
     _original_sigint_handler = None
+    _original_sigterm_handler = None
     _sigint_handler_installed = False
     _sigint_handler_owned_by_us = False
 
@@ -822,6 +920,13 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
             stderr=subprocess.PIPE,
             text=True,
             shell=False,
+            # Give the subprocess its own PGID so shutdown can kill
+            # the whole tree — otherwise orphaned grandchildren (a
+            # bash script's ``sleep``, a python script's
+            # ``multiprocessing`` workers, ...) keep the parent
+            # stdout FD open and ``proc.communicate`` blocks until
+            # they exit on their own.
+            start_new_session=True,
         )
     except FileNotFoundError:
         result["error"] = "command not found"
@@ -837,6 +942,12 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         return result
 
     _register_live_proc(proc)
+    # Close the shutdown race: if shutdown_async_hooks() snapshotted
+    # _live_procs *before* we registered this proc, it will not have
+    # been SIGTERM'd and proc.communicate() below would block for up
+    # to spec.timeout.  Self-terminate so the worker exits promptly.
+    if _async_shutting_down:
+        _terminate_group(proc)
     try:
         try:
             stdout, stderr = proc.communicate(
@@ -845,17 +956,11 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         except subprocess.TimeoutExpired:
             # Terminate the stuck child and drain any partial output so
             # the caller doesn't deadlock on pipe buffers.
-            try:
-                proc.terminate()
-            except OSError:
-                pass
+            _terminate_group(proc)
             try:
                 stdout, stderr = proc.communicate(timeout=2)
             except subprocess.TimeoutExpired:
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+                _kill_group(proc)
                 try:
                     stdout, stderr = proc.communicate(timeout=2)
                 except Exception:
@@ -986,7 +1091,16 @@ def _make_async_callback(spec: ShellHookSpec) -> Callable[..., None]:
         try:
             fut = _async_pool_get().submit(_run_async_body, spec, payload)
         except RuntimeError:
-            _async_sem_get().release()
+            # Symmetric to _on_async_future_done: snapshot the sem so
+            # _reset_async_pool running between acquire and release
+            # doesn't prompt us into lazy-creating a fresh sem just to
+            # over-release on it.
+            sem = _async_sem_inst
+            if sem is not None:
+                try:
+                    sem.release()
+                except ValueError:
+                    logger.debug("async semaphore over-release; ignored")
             logger.debug(
                 "async pool shutting down — dropping firing "
                 "event=%s command=%s",

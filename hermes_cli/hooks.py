@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -251,6 +252,7 @@ def _cmd_test(args) -> None:
         return
 
     no_wait = bool(getattr(args, "no_wait", False))
+    scheduled_any_async = False
 
     print(f"Firing {len(specs)} hook(s) for event '{event}':\n")
     for spec in specs:
@@ -270,12 +272,38 @@ def _cmd_test(args) -> None:
             print("      fire-and-forget: stdout not collected. "
                   "Use `hermes hooks test <event>` without --no-wait "
                   "to block on completion and see output.")
+            scheduled_any_async = True
         else:
             # Sync specs OR async specs without --no-wait: run
             # synchronously via run_once so users see stdout/parsed.
             result = shell_hooks.run_once(spec, payload)
             _print_run_result(result)
         print()
+
+    # Without this, --no-wait would still block for the full hook
+    # runtime: the ThreadPoolExecutor's atexit handler calls
+    # pool.shutdown(wait=True) which joins the worker, which in turn
+    # waits for the subprocess to finish.  The whole point of
+    # --no-wait is to exercise fire-and-forget behaviour — honour
+    # that by skipping atexit via ``os._exit``.  The hook subprocess
+    # was spawned with ``start_new_session=True`` so it keeps running
+    # under init after the CLI exits; its logs (stdout/stderr) are
+    # discarded because ``--no-wait`` is a scheduling-latency probe,
+    # not a functional test.
+    if scheduled_any_async:
+        # Race: if the worker thread hasn't picked up the task yet,
+        # ``os._exit`` runs before ``Popen`` and the hook never
+        # spawns.  Wait briefly for the subprocess to register
+        # itself in ``_live_procs``.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with shell_hooks._async_tracking_lock:
+                if shell_hooks._live_procs:
+                    break
+            time.sleep(0.01)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 def _print_run_result(result: Dict[str, Any]) -> None:

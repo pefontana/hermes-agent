@@ -8,7 +8,7 @@ Covers aggregate firing from tools.delegate_tool.delegate_task:
   * fires on the parent thread
   * carries role, task_index, status, duration, summary for each child
   * total_duration_ms matches the returned total_duration_seconds
-  * the helper field _child_role_for_batch is stripped from the tool result
+  * the helper field _child_role is stripped from the tool result
   * shell hooks registered on the event receive the extra.* nested payload
 """
 
@@ -314,8 +314,10 @@ class TestPayload:
         assert child["summary"] == "result"
 
     def test_payload_strips_helper_field_from_tool_result(self):
-        """The internal _child_role_for_batch helper must not leak into
-        the returned tool-result JSON."""
+        """The internal ``_child_role`` helper must be stripped from
+        every result entry before ``delegate_task`` serialises the
+        tool result — otherwise it leaks into the JSON returned to the
+        model."""
         _register_capturing_hook("subagent_batch_complete")
 
         with patch("tools.delegate_tool._run_single_child") as mock_run:
@@ -333,7 +335,10 @@ class TestPayload:
             )
 
         parsed = json.loads(raw)
-        assert "_child_role_for_batch" not in json.dumps(parsed)
+        assert "_child_role" not in json.dumps(parsed), (
+            "_child_role leaked into the serialised tool result; the "
+            "strip pass after subagent_batch_complete is broken."
+        )
 
     def test_total_duration_matches_returned_json(self):
         captured = _register_capturing_hook("subagent_batch_complete")
