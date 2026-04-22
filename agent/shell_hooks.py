@@ -94,19 +94,10 @@ _DEFAULT_ASYNC_SHUTDOWN_GRACE = 5
 _ASYNC_POOL_SIZE_BOUNDS = (1, 100)
 _ASYNC_SHUTDOWN_GRACE_BOUNDS = (0, 60)
 
-# Events where ``async: true`` is silently accepted — hook output is
-# logged and discarded.
-_ACCEPTED_ASYNC_EVENTS = frozenset({
-    "post_tool_call", "post_llm_call",
-    "pre_api_request", "post_api_request",
-    "on_session_start", "on_session_end",
-    "on_session_finalize", "on_session_reset",
-    "subagent_stop", "subagent_batch_complete",
-})
-
 # Events where ``async: true`` registers with a warning because the
 # return value is typically load-bearing but there are observational
-# use cases (fire-and-forget logging per tool call).
+# use cases (fire-and-forget logging per tool call).  Events not in
+# this set and not in the reject set are silently accepted.
 _WARN_ASYNC_EVENTS = frozenset({"pre_tool_call"})
 
 # Events where ``async: true`` is a hard config error — the return
@@ -147,16 +138,25 @@ _live_futures: Set[concurrent.futures.Future] = set()
 
 # Async pool / semaphore singletons — created lazily on first use so
 # tests and CLI/gateway startup don't eagerly spin up worker threads.
+# Double-checked locking via ``_async_init_lock`` prevents two
+# concurrent firings from racing through the ``is None`` check and
+# each constructing their own pool/semaphore (the first one leaks).
 _async_pool_inst: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _async_sem_inst: Optional[threading.BoundedSemaphore] = None
+_async_init_lock = threading.Lock()
 _async_shutting_down = False
 _async_atexit_registered = False
 
 # SIGINT chaining state: only CLI-mode installs a handler (the gateway
-# owns its own asyncio-native handler, see gateway/run.py).  Tracked so
-# _reset_async_pool() can restore the original handler between tests.
+# owns its own asyncio-native handler, see gateway/run.py).
+# ``_sigint_handler_owned_by_us`` is true only after
+# ``_maybe_install_sigint_handler`` actually swapped the handler — tests
+# that set ``_sigint_handler_installed`` manually don't flip it, so
+# ``_reset_async_pool`` won't restore a handler the module never owned
+# back onto the test runner's signal disposition.
 _original_sigint_handler: Any = None
 _sigint_handler_installed = False
+_sigint_handler_owned_by_us = False
 
 
 @dataclass
@@ -517,52 +517,66 @@ def _async_config() -> Tuple[int, int]:
 
 def _async_pool_get() -> concurrent.futures.ThreadPoolExecutor:
     """Lazy-init the async pool.  Idempotent across CLI + gateway
-    startup; registers the atexit shutdown sweep on first call."""
+    startup; registers the atexit shutdown sweep on first call.
+    Double-checked under ``_async_init_lock`` so concurrent callbacks
+    can't race into creating two pools."""
     global _async_pool_inst, _async_atexit_registered
     if _async_pool_inst is None:
-        pool_size, _ = _async_config()
-        _async_pool_inst = concurrent.futures.ThreadPoolExecutor(
-            max_workers=pool_size,
-            thread_name_prefix="hermes-async-hook",
-        )
-        if not _async_atexit_registered:
-            atexit.register(shutdown_async_hooks)
-            _async_atexit_registered = True
+        with _async_init_lock:
+            if _async_pool_inst is None:
+                pool_size, _ = _async_config()
+                _async_pool_inst = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=pool_size,
+                    thread_name_prefix="hermes-async-hook",
+                )
+                if not _async_atexit_registered:
+                    atexit.register(shutdown_async_hooks)
+                    _async_atexit_registered = True
     return _async_pool_inst
 
 
 def _async_sem_get() -> threading.BoundedSemaphore:
     """Lazy-init the bounded semaphore that provides real backpressure
-    on async hook firings.  Sized to match the pool."""
+    on async hook firings.  Sized to match the pool.  Double-checked
+    under the shared init lock."""
     global _async_sem_inst
     if _async_sem_inst is None:
-        pool_size, _ = _async_config()
-        _async_sem_inst = threading.BoundedSemaphore(pool_size)
+        with _async_init_lock:
+            if _async_sem_inst is None:
+                pool_size, _ = _async_config()
+                _async_sem_inst = threading.BoundedSemaphore(pool_size)
     return _async_sem_inst
 
 
 def _on_async_future_done(fut: concurrent.futures.Future) -> None:
     """Unified done_callback: release the backpressure semaphore, drop
-    tracking, and surface worker-body crashes so they don't vanish."""
+    tracking, and surface worker-body crashes so they don't vanish.
+
+    Snapshots ``_async_sem_inst`` instead of going through
+    ``_async_sem_get`` — if ``_reset_async_pool`` ran between submit
+    and callback, the live semaphore is gone and there is nothing to
+    release.  Creating a fresh semaphore just to release on it would
+    leave it with count > its bound."""
     try:
         exc = fut.exception()
     except concurrent.futures.CancelledError:
         exc = None
-    except Exception:
-        exc = None
 
     if exc is not None:
-        logger.warning(
-            "async shell hook worker crashed: %s", exc, exc_info=exc,
-        )
+        logger.warning("async shell hook worker crashed", exc_info=exc)
 
-    try:
-        _async_sem_get().release()
-    finally:
-        _unregister_future(fut)
+    sem = _async_sem_inst
+    if sem is not None:
+        try:
+            sem.release()
+        except ValueError:
+            # Over-release only happens if the semaphore was swapped
+            # out mid-flight (e.g. test reset).  Benign; ignore.
+            logger.debug("async semaphore over-release; ignored")
+    _unregister_future(fut)
 
 
-def _run_async_body(spec: "ShellHookSpec", payload: str) -> None:
+def _run_async_body(spec: ShellHookSpec, payload: str) -> None:
     """Worker body: run the hook, log the outcome, discard the response.
 
     Block directives on ``pre_tool_call`` are explicitly logged at WARN
@@ -692,10 +706,7 @@ def _async_pool_sigint_handler(signum, frame):
     handler = _original_sigint_handler
     if handler in (signal.SIG_DFL, signal.SIG_IGN, None):
         raise KeyboardInterrupt()
-    try:
-        handler(signum, frame)
-    except KeyboardInterrupt:
-        raise
+    handler(signum, frame)
 
 
 def _maybe_install_sigint_handler() -> None:
@@ -707,6 +718,7 @@ def _maybe_install_sigint_handler() -> None:
     raises ``ValueError`` off the main thread).
     """
     global _original_sigint_handler, _sigint_handler_installed
+    global _sigint_handler_owned_by_us
     if _sigint_handler_installed:
         return
     try:
@@ -714,6 +726,7 @@ def _maybe_install_sigint_handler() -> None:
             signal.SIGINT, _async_pool_sigint_handler,
         )
         _sigint_handler_installed = True
+        _sigint_handler_owned_by_us = True
     except (ValueError, OSError):
         logger.debug(
             "SIGINT handler not installed for async hooks (not main "
@@ -732,6 +745,7 @@ def _reset_async_pool() -> None:
     """
     global _async_pool_inst, _async_sem_inst, _async_shutting_down
     global _original_sigint_handler, _sigint_handler_installed
+    global _sigint_handler_owned_by_us
 
     if _async_pool_inst is not None or _live_procs:
         try:
@@ -747,13 +761,20 @@ def _reset_async_pool() -> None:
     _async_sem_inst = None
     _async_shutting_down = False
 
-    if _sigint_handler_installed and _original_sigint_handler is not None:
+    # Only restore a SIGINT handler we actually installed ourselves —
+    # tests that flip ``_sigint_handler_installed`` manually (to
+    # exercise ``_async_pool_sigint_handler`` without running
+    # ``_maybe_install_sigint_handler``) haven't mutated the process's
+    # real signal disposition, so we must not write a fake handler
+    # back into it.
+    if _sigint_handler_owned_by_us and _original_sigint_handler is not None:
         try:
             signal.signal(signal.SIGINT, _original_sigint_handler)
         except (ValueError, OSError):
             pass
     _original_sigint_handler = None
     _sigint_handler_installed = False
+    _sigint_handler_owned_by_us = False
 
 
 def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
@@ -904,17 +925,13 @@ def _make_sync_callback(
                 r["returncode"], spec.event, spec.command, stderr[:400],
             )
 
-        parsed = _parse_response(spec.event, r["stdout"])
+        parsed, extras = _parse_response_with_extras(spec.event, r["stdout"])
 
         # Claude-Code compatibility: warn-and-ignore if the script
         # declared itself async at runtime.  Hermes only supports
         # config-declared async — this keeps copy-pasted scripts from
         # confusing hook authors.
-        try:
-            data = json.loads((r["stdout"] or "").strip() or "null")
-        except json.JSONDecodeError:
-            data = None
-        if isinstance(data, dict) and data.get("async") is True:
+        if extras.get("async") is True:
             logger.warning(
                 "shell hook requested async at runtime but Hermes only "
                 "supports config-declared async (event=%s command=%s); "
@@ -1021,9 +1038,22 @@ def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:
 
     Anything else returns ``None``.
     """
+    parsed, _ = _parse_response_with_extras(event, stdout)
+    return parsed
+
+
+def _parse_response_with_extras(
+    event: str, stdout: str,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Like :func:`_parse_response` but also returns the raw decoded
+    dict so callers can inspect fields that aren't part of the canonical
+    wire shape (today: the Claude-Code runtime ``async`` marker).  The
+    extras dict is empty whenever the stdout failed to decode as a JSON
+    object.  Single parse — used by :func:`_make_sync_callback` so the
+    callback doesn't have to JSON-decode the same string twice."""
     stdout = (stdout or "").strip()
     if not stdout:
-        return None
+        return None, {}
 
     try:
         data = json.loads(stdout)
@@ -1032,27 +1062,27 @@ def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:
             "shell hook stdout was not valid JSON (event=%s): %s",
             event, stdout[:200],
         )
-        return None
+        return None, {}
 
     if not isinstance(data, dict):
-        return None
+        return None, {}
 
     if event == "pre_tool_call":
         if data.get("action") == "block":
             message = data.get("message") or data.get("reason") or ""
             if isinstance(message, str) and message:
-                return {"action": "block", "message": message}
+                return {"action": "block", "message": message}, data
         if data.get("decision") == "block":
             message = data.get("reason") or data.get("message") or ""
             if isinstance(message, str) and message:
-                return {"action": "block", "message": message}
-        return None
+                return {"action": "block", "message": message}, data
+        return None, data
 
     context = data.get("context")
     if isinstance(context, str) and context.strip():
-        return {"context": context}
+        return {"context": context}, data
 
-    return None
+    return None, data
 
 
 # ---------------------------------------------------------------------------
