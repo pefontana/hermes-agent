@@ -1770,19 +1770,17 @@ def delegate_task(
     except Exception:
         _invoke_hook = None
 
-    # Preserve role for the batch aggregate before the per-child loop pops it.
+    # Read (not pop) _child_role so the batch aggregate below can still
+    # see it.  The field is stripped from every entry after the batch
+    # firing so it doesn't leak into the serialised tool result.
     for entry in results:
-        entry["_child_role_for_batch"] = entry.get("_child_role")
-
-    for entry in results:
-        child_role = entry.pop("_child_role", None)
         if _invoke_hook is None:
             continue
         try:
             _invoke_hook(
                 "subagent_stop",
                 parent_session_id=_parent_session_id,
-                child_role=child_role,
+                child_role=entry.get("_child_role"),
                 child_summary=entry.get("summary"),
                 child_status=entry.get("status"),
                 duration_ms=int((entry.get("duration_seconds") or 0) * 1000),
@@ -1820,7 +1818,7 @@ def delegate_task(
                 total_duration_ms=int(total_duration * 1000),
                 children=[{
                     "task_index": e.get("task_index"),
-                    "role": e.get("_child_role_for_batch"),
+                    "role": e.get("_child_role"),
                     "status": e.get("status"),
                     "duration_ms": int((e.get("duration_seconds") or 0) * 1000),
                     "summary": e.get("summary"),
@@ -1831,8 +1829,10 @@ def delegate_task(
                 "subagent_batch_complete hook invocation failed", exc_info=True,
             )
 
+    # Strip the internal helper from every entry before the tool
+    # result is serialised back to the model.
     for entry in results:
-        entry.pop("_child_role_for_batch", None)
+        entry.pop("_child_role", None)
 
     return json.dumps(
         {

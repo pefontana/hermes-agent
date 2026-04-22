@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -262,9 +263,9 @@ def _cmd_test(args) -> None:
             # Fire through the real async path so backpressure,
             # tracking, and shutdown semantics are all exercised.
             cb = shell_hooks._make_async_callback(spec)
-            t0 = _time_now()
+            t0 = time.monotonic()
             cb(**payload)
-            elapsed = round(_time_now() - t0, 4)
+            elapsed = round(time.monotonic() - t0, 4)
             print(f"      scheduled in {elapsed}s (fire-and-forget)")
             print("      fire-and-forget: stdout not collected. "
                   "Use `hermes hooks test <event>` without --no-wait "
@@ -275,11 +276,6 @@ def _cmd_test(args) -> None:
             result = shell_hooks.run_once(spec, payload)
             _print_run_result(result)
         print()
-
-
-def _time_now() -> float:
-    import time
-    return time.monotonic()
 
 
 def _print_run_result(result: Dict[str, Any]) -> None:
