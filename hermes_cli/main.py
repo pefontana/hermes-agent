@@ -7326,6 +7326,14 @@ For more help on a command:
             "synthetic payload before execution"
         ),
     )
+    _hk_test.add_argument(
+        "--no-wait", dest="no_wait", action="store_true", default=False,
+        help=(
+            "For async hooks, return as soon as the callback is scheduled "
+            "instead of waiting for the subprocess to complete. Useful "
+            "for testing the fire-and-forget path itself."
+        ),
+    )
 
     _hk_revoke = hooks_subparsers.add_parser(
         "revoke", aliases=["remove", "rm"],

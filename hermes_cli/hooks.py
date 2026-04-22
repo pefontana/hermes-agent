@@ -81,9 +81,10 @@ def _cmd_list(_args) -> None:
             is_approved = (spec.event, spec.command) in approved
             status = "✓ allowed" if is_approved else "✗ not allowlisted"
             matcher_part = f" matcher={spec.matcher!r}" if spec.matcher else ""
+            async_part = " [async]" if spec.is_async else ""
             print(
                 f"    - {spec.command}{matcher_part} "
-                f"(timeout={spec.timeout}s, {status})"
+                f"(timeout={spec.timeout}s, {status}){async_part}"
             )
 
             if is_approved:
@@ -248,12 +249,37 @@ def _cmd_test(args) -> None:
             print(f"(with matcher filter --for-tool={args.for_tool})")
         return
 
+    no_wait = bool(getattr(args, "no_wait", False))
+
     print(f"Firing {len(specs)} hook(s) for event '{event}':\n")
     for spec in specs:
-        print(f"  → {spec.command}")
-        result = shell_hooks.run_once(spec, payload)
-        _print_run_result(result)
+        tag = " [async, --no-wait]" if spec.is_async and no_wait else (
+            " [async, blocking until complete]" if spec.is_async else ""
+        )
+        print(f"  → {spec.command}{tag}")
+
+        if spec.is_async and no_wait:
+            # Fire through the real async path so backpressure,
+            # tracking, and shutdown semantics are all exercised.
+            cb = shell_hooks._make_async_callback(spec)
+            t0 = _time_now()
+            cb(**payload)
+            elapsed = round(_time_now() - t0, 4)
+            print(f"      scheduled in {elapsed}s (fire-and-forget)")
+            print("      fire-and-forget: stdout not collected. "
+                  "Use `hermes hooks test <event>` without --no-wait "
+                  "to block on completion and see output.")
+        else:
+            # Sync specs OR async specs without --no-wait: run
+            # synchronously via run_once so users see stdout/parsed.
+            result = shell_hooks.run_once(spec, payload)
+            _print_run_result(result)
         print()
+
+
+def _time_now() -> float:
+    import time
+    return time.monotonic()
 
 
 def _print_run_result(result: Dict[str, Any]) -> None:
@@ -334,6 +360,15 @@ def _cmd_doctor(_args) -> None:
 
 def _doctor_one(spec, shell_hooks) -> int:
     problems = 0
+
+    # 0. Surface async caveats — async pre_tool_call cannot block.
+    if spec.is_async and spec.event == "pre_tool_call":
+        print(
+            "      ⚠ async pre_tool_call hooks are fire-and-forget — any "
+            "{\"action\": \"block\"} return will be ignored because the "
+            "tool has already executed by the time the async hook "
+            "completes"
+        )
 
     # 1. Script exists and is executable
     if shell_hooks.script_is_executable(spec.command):
