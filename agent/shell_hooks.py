@@ -100,6 +100,15 @@ _registered_lock = threading.Lock()
 # ``.lock`` file via ``fcntl.flock`` and bypass this.
 _allowlist_write_lock = threading.Lock()
 
+# Live subprocess tracking for a future async / shutdown path.
+# Populated by ``_spawn`` for the duration of each subprocess call;
+# drained in the ``finally`` after ``communicate`` returns.  CPython's
+# GIL makes individual ``add`` / ``discard`` calls atomic, but any
+# future iteration (e.g. shutdown sweep) must be locked against
+# concurrent discard — hence the explicit lock.
+_async_tracking_lock = threading.Lock()
+_live_procs: Set[subprocess.Popen] = set()
+
 
 @dataclass
 class ShellHookSpec:
@@ -359,6 +368,16 @@ def _parse_single_entry(
 _TOP_LEVEL_PAYLOAD_KEYS = {"tool_name", "args", "session_id", "parent_session_id"}
 
 
+def _register_live_proc(proc: subprocess.Popen) -> None:
+    with _async_tracking_lock:
+        _live_procs.add(proc)
+
+
+def _unregister_live_proc(proc: subprocess.Popen) -> None:
+    with _async_tracking_lock:
+        _live_procs.discard(proc)
+
+
 def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
     """Run ``spec.command`` as a subprocess with ``stdin_json`` on stdin.
 
@@ -368,6 +387,14 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
     subprocess is actually invoked — both the live callback path
     (:func:`_make_callback`) and the CLI test helper (:func:`run_once`)
     go through it.
+
+    Uses :class:`subprocess.Popen` + :meth:`Popen.communicate` with the
+    handle registered in :data:`_live_procs` for the duration of the
+    call.  That lets an external shutdown path terminate the child
+    without waiting for the full ``spec.timeout`` to elapse inside a
+    worker thread.  For sync callers the behaviour is semantically
+    identical to the prior ``subprocess.run`` implementation (block
+    until exit or timeout, terminate+kill on timeout).
     """
     result: Dict[str, Any] = {
         "returncode": None,
@@ -388,31 +415,62 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
 
     t0 = time.monotonic()
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            input=stdin_json,
-            capture_output=True,
-            timeout=spec.timeout,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             shell=False,
         )
-    except subprocess.TimeoutExpired:
-        result["timed_out"] = True
-        result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
-        return result
     except FileNotFoundError:
         result["error"] = "command not found"
         return result
     except PermissionError:
         result["error"] = "command not executable"
         return result
+    except OSError as exc:
+        result["error"] = str(exc)
+        return result
     except Exception as exc:  # pragma: no cover — defensive
         result["error"] = str(exc)
         return result
 
+    _register_live_proc(proc)
+    try:
+        try:
+            stdout, stderr = proc.communicate(
+                input=stdin_json, timeout=spec.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            # Terminate the stuck child and drain any partial output so
+            # the caller doesn't deadlock on pipe buffers.
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            try:
+                stdout, stderr = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    stdout, stderr = proc.communicate(timeout=2)
+                except Exception:
+                    stdout, stderr = "", ""
+            result["timed_out"] = True
+            result["stdout"] = stdout or ""
+            result["stderr"] = stderr or ""
+            result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
+            return result
+    finally:
+        _unregister_live_proc(proc)
+
     result["returncode"] = proc.returncode
-    result["stdout"] = proc.stdout or ""
-    result["stderr"] = proc.stderr or ""
+    result["stdout"] = stdout or ""
+    result["stderr"] = stderr or ""
     result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
     return result
 
