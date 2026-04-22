@@ -53,12 +53,15 @@ Wire protocol
 
 from __future__ import annotations
 
+import atexit
+import concurrent.futures
 import difflib
 import json
 import logging
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -83,6 +86,38 @@ DEFAULT_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 300
 ALLOWLIST_FILENAME = "shell-hooks-allowlist.json"
 
+# Async-hook config clamps.  Both values are pulled live from
+# ``cli-config.yaml`` so tests and operator overrides flow through
+# without code change.
+_DEFAULT_ASYNC_POOL_SIZE = 10
+_DEFAULT_ASYNC_SHUTDOWN_GRACE = 5
+_ASYNC_POOL_SIZE_BOUNDS = (1, 100)
+_ASYNC_SHUTDOWN_GRACE_BOUNDS = (0, 60)
+
+# Events where ``async: true`` is silently accepted — hook output is
+# logged and discarded.
+_ACCEPTED_ASYNC_EVENTS = frozenset({
+    "post_tool_call", "post_llm_call",
+    "pre_api_request", "post_api_request",
+    "on_session_start", "on_session_end",
+    "on_session_finalize", "on_session_reset",
+    "subagent_stop", "subagent_batch_complete",
+})
+
+# Events where ``async: true`` registers with a warning because the
+# return value is typically load-bearing but there are observational
+# use cases (fire-and-forget logging per tool call).
+_WARN_ASYNC_EVENTS = frozenset({"pre_tool_call"})
+
+# Events where ``async: true`` is a hard config error — the return
+# value is the *only* product of the hook, so async would make the
+# registration 100% useless.  Rejected at config-parse time.
+_REJECT_ASYNC_EVENTS = frozenset({
+    "pre_llm_call",
+    "transform_tool_result",
+    "transform_terminal_output",
+})
+
 # (event, matcher, command) triples that have been wired to the plugin
 # manager in the current process.  Matcher is part of the key because
 # the same script can legitimately register for different matchers under
@@ -100,14 +135,28 @@ _registered_lock = threading.Lock()
 # ``.lock`` file via ``fcntl.flock`` and bypass this.
 _allowlist_write_lock = threading.Lock()
 
-# Live subprocess tracking for a future async / shutdown path.
-# Populated by ``_spawn`` for the duration of each subprocess call;
-# drained in the ``finally`` after ``communicate`` returns.  CPython's
-# GIL makes individual ``add`` / ``discard`` calls atomic, but any
-# future iteration (e.g. shutdown sweep) must be locked against
-# concurrent discard — hence the explicit lock.
+# Live subprocess and future tracking for the shutdown / SIGINT path.
+# Populated by ``_spawn`` (procs) and the async callback factory
+# (futures); drained by ``shutdown_async_hooks`` and SIGINT handlers.
+# CPython's GIL makes individual ``add`` / ``discard`` calls atomic, but
+# iteration during shutdown must be locked against concurrent
+# done_callback removal — hence the explicit lock.
 _async_tracking_lock = threading.Lock()
 _live_procs: Set[subprocess.Popen] = set()
+_live_futures: Set[concurrent.futures.Future] = set()
+
+# Async pool / semaphore singletons — created lazily on first use so
+# tests and CLI/gateway startup don't eagerly spin up worker threads.
+_async_pool_inst: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_async_sem_inst: Optional[threading.BoundedSemaphore] = None
+_async_shutting_down = False
+_async_atexit_registered = False
+
+# SIGINT chaining state: only CLI-mode installs a handler (the gateway
+# owns its own asyncio-native handler, see gateway/run.py).  Tracked so
+# _reset_async_pool() can restore the original handler between tests.
+_original_sigint_handler: Any = None
+_sigint_handler_installed = False
 
 
 @dataclass
@@ -118,6 +167,7 @@ class ShellHookSpec:
     command: str
     matcher: Optional[str] = None
     timeout: int = DEFAULT_TIMEOUT_SECONDS
+    is_async: bool = False
     compiled_matcher: Optional[re.Pattern] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -353,11 +403,41 @@ def _parse_single_entry(
         )
         timeout = MAX_TIMEOUT_SECONDS
 
+    async_raw = raw.get("async", False)
+    if not isinstance(async_raw, bool):
+        logger.warning(
+            "hooks.%s[%d].async must be a boolean; got %r. Defaulting to sync.",
+            event, index, async_raw,
+        )
+        is_async = False
+    else:
+        is_async = async_raw
+
+    if is_async:
+        if event in _REJECT_ASYNC_EVENTS:
+            logger.error(
+                "hooks.%s[%d] cannot use async: true — the %s event only "
+                "propagates through its return value (context injection / "
+                "tool-result or terminal-output transform), and an async "
+                "firing would discard it. Skipping this hook.",
+                event, index, event,
+            )
+            return None
+        if event in _WARN_ASYNC_EVENTS:
+            logger.warning(
+                "hooks.%s[%d] uses async: true — %s block directives will "
+                "be ignored because the tool has already executed by the "
+                "time the background subprocess completes. Accepted for "
+                "observational use cases.",
+                event, index, event,
+            )
+
     return ShellHookSpec(
         event=event,
         command=command.strip(),
         matcher=matcher,
         timeout=timeout,
+        is_async=is_async,
     )
 
 
@@ -378,6 +458,304 @@ def _unregister_live_proc(proc: subprocess.Popen) -> None:
         _live_procs.discard(proc)
 
 
+def _register_future(fut: concurrent.futures.Future) -> None:
+    with _async_tracking_lock:
+        _live_futures.add(fut)
+
+
+def _unregister_future(fut: concurrent.futures.Future) -> None:
+    with _async_tracking_lock:
+        _live_futures.discard(fut)
+
+
+# ---------------------------------------------------------------------------
+# Async config lookups (clamped on read — cheap enough to do per submit)
+# ---------------------------------------------------------------------------
+
+def _clamp_int(value: Any, default: int, bounds: Tuple[int, int]) -> int:
+    lo, hi = bounds
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    if n < lo:
+        logger.warning(
+            "async-hook config value %r below minimum %d; clamping", n, lo,
+        )
+        return lo
+    if n > hi:
+        logger.warning(
+            "async-hook config value %r above maximum %d; clamping", n, hi,
+        )
+        return hi
+    return n
+
+
+def _async_config() -> Tuple[int, int]:
+    """Return ``(pool_size, shutdown_grace_seconds)`` from config.
+
+    Read lazily so tests can monkeypatch ``load_config`` before the pool
+    is first materialised.  Failure falls back to the module defaults.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    pool = _clamp_int(
+        cfg.get("hooks_async_pool_size"),
+        _DEFAULT_ASYNC_POOL_SIZE,
+        _ASYNC_POOL_SIZE_BOUNDS,
+    )
+    grace = _clamp_int(
+        cfg.get("hooks_async_shutdown_grace_seconds"),
+        _DEFAULT_ASYNC_SHUTDOWN_GRACE,
+        _ASYNC_SHUTDOWN_GRACE_BOUNDS,
+    )
+    return pool, grace
+
+
+def _async_pool_get() -> concurrent.futures.ThreadPoolExecutor:
+    """Lazy-init the async pool.  Idempotent across CLI + gateway
+    startup; registers the atexit shutdown sweep on first call."""
+    global _async_pool_inst, _async_atexit_registered
+    if _async_pool_inst is None:
+        pool_size, _ = _async_config()
+        _async_pool_inst = concurrent.futures.ThreadPoolExecutor(
+            max_workers=pool_size,
+            thread_name_prefix="hermes-async-hook",
+        )
+        if not _async_atexit_registered:
+            atexit.register(shutdown_async_hooks)
+            _async_atexit_registered = True
+    return _async_pool_inst
+
+
+def _async_sem_get() -> threading.BoundedSemaphore:
+    """Lazy-init the bounded semaphore that provides real backpressure
+    on async hook firings.  Sized to match the pool."""
+    global _async_sem_inst
+    if _async_sem_inst is None:
+        pool_size, _ = _async_config()
+        _async_sem_inst = threading.BoundedSemaphore(pool_size)
+    return _async_sem_inst
+
+
+def _on_async_future_done(fut: concurrent.futures.Future) -> None:
+    """Unified done_callback: release the backpressure semaphore, drop
+    tracking, and surface worker-body crashes so they don't vanish."""
+    try:
+        exc = fut.exception()
+    except concurrent.futures.CancelledError:
+        exc = None
+    except Exception:
+        exc = None
+
+    if exc is not None:
+        logger.warning(
+            "async shell hook worker crashed: %s", exc, exc_info=exc,
+        )
+
+    try:
+        _async_sem_get().release()
+    finally:
+        _unregister_future(fut)
+
+
+def _run_async_body(spec: "ShellHookSpec", payload: str) -> None:
+    """Worker body: run the hook, log the outcome, discard the response.
+
+    Block directives on ``pre_tool_call`` are explicitly logged at WARN
+    so users who migrate a sync ``pre_tool_call`` hook to async don't
+    silently lose their block.
+    """
+    r = _spawn(spec, payload)
+
+    if r.get("error"):
+        logger.warning(
+            "async shell hook failed (event=%s command=%s): %s",
+            spec.event, spec.command, r["error"],
+        )
+        return
+    if r.get("timed_out"):
+        logger.warning(
+            "async shell hook timed out after %.2fs (event=%s command=%s)",
+            r.get("elapsed_seconds", 0), spec.event, spec.command,
+        )
+        return
+
+    stderr = (r.get("stderr") or "").strip()
+    if stderr:
+        logger.debug(
+            "async shell hook stderr (event=%s command=%s): %s",
+            spec.event, spec.command, stderr[:400],
+        )
+    rc = r.get("returncode")
+    if rc not in (0, None):
+        logger.warning(
+            "async shell hook exited %d (event=%s command=%s); stderr=%s",
+            rc, spec.event, spec.command, stderr[:400],
+        )
+
+    parsed = _parse_response(spec.event, r.get("stdout") or "")
+    if (
+        spec.event == "pre_tool_call"
+        and parsed
+        and parsed.get("action") == "block"
+    ):
+        logger.warning(
+            "async shell hook returned block directive but firing is "
+            "async — tool has already executed (event=%s command=%s "
+            "message=%r)",
+            spec.event, spec.command, parsed.get("message"),
+        )
+
+
+def shutdown_async_hooks(grace_seconds: Optional[float] = None) -> None:
+    """Tear down the async hook pool.
+
+    Safe to call from:
+      * the atexit handler (CLI default)
+      * the gateway's asyncio shutdown path
+      * ``_reset_async_pool()`` in tests
+
+    Idempotent — subsequent calls after the first are no-ops.
+    Terminates every tracked subprocess with SIGTERM, waits up to
+    ``grace_seconds`` (default: config-derived) for clean exits, and
+    SIGKILLs survivors.  Workers exit once their subprocess is gone.
+    """
+    global _async_shutting_down
+    if _async_shutting_down:
+        return
+    _async_shutting_down = True
+
+    pool = _async_pool_inst
+    if pool is not None:
+        pool.shutdown(wait=False)
+
+    if grace_seconds is None:
+        _, grace_seconds = _async_config()
+
+    with _async_tracking_lock:
+        procs = list(_live_procs)
+    for proc in procs:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+    deadline = time.monotonic() + max(0.0, float(grace_seconds))
+    for proc in procs:
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                logger.warning(
+                    "async shell hook subprocess exceeded shutdown grace "
+                    "(%.1fs) — killed pid=%d",
+                    grace_seconds, proc.pid,
+                )
+            except Exception:
+                pass
+
+    if pool is not None:
+        try:
+            pool.shutdown(wait=True)
+        except Exception:
+            pass
+
+
+def _async_pool_sigint_handler(signum, frame):
+    """CLI-mode SIGINT handler: terminate tracked subprocesses without
+    waiting the shutdown-grace window, then chain to the original
+    handler so ``KeyboardInterrupt`` propagation still happens.
+
+    Installed only by CLI-mode callers (see
+    ``_maybe_install_sigint_handler``); the gateway integrates
+    ``shutdown_async_hooks`` into its asyncio shutdown sequence
+    instead.
+    """
+    with _async_tracking_lock:
+        procs = list(_live_procs)
+    for proc in procs:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+    handler = _original_sigint_handler
+    if handler in (signal.SIG_DFL, signal.SIG_IGN, None):
+        raise KeyboardInterrupt()
+    try:
+        handler(signum, frame)
+    except KeyboardInterrupt:
+        raise
+
+
+def _maybe_install_sigint_handler() -> None:
+    """Install the CLI async-hook SIGINT handler exactly once.
+
+    Only the CLI entry point calls this; the gateway owns its own
+    asyncio-native signal disposition.  Wrapped in try/except so
+    non-main-thread callers degrade to atexit-only (``signal.signal``
+    raises ``ValueError`` off the main thread).
+    """
+    global _original_sigint_handler, _sigint_handler_installed
+    if _sigint_handler_installed:
+        return
+    try:
+        _original_sigint_handler = signal.signal(
+            signal.SIGINT, _async_pool_sigint_handler,
+        )
+        _sigint_handler_installed = True
+    except (ValueError, OSError):
+        logger.debug(
+            "SIGINT handler not installed for async hooks (not main "
+            "thread); relying on atexit shutdown + "
+            "hooks_async_shutdown_grace_seconds",
+        )
+
+
+def _reset_async_pool() -> None:
+    """Test-only: drop every piece of async-pool module state.
+
+    Complements :func:`reset_for_tests` (which clears the registration
+    set).  Must be called from test teardown that varied pool size,
+    grace window, or triggered shutdown during the test; otherwise the
+    next test sees stale singletons and leaked subprocesses.
+    """
+    global _async_pool_inst, _async_sem_inst, _async_shutting_down
+    global _original_sigint_handler, _sigint_handler_installed
+
+    if _async_pool_inst is not None or _live_procs:
+        try:
+            shutdown_async_hooks(grace_seconds=0.5)
+        except Exception:
+            pass
+
+    with _async_tracking_lock:
+        _live_procs.clear()
+        _live_futures.clear()
+
+    _async_pool_inst = None
+    _async_sem_inst = None
+    _async_shutting_down = False
+
+    if _sigint_handler_installed and _original_sigint_handler is not None:
+        try:
+            signal.signal(signal.SIGINT, _original_sigint_handler)
+        except (ValueError, OSError):
+            pass
+    _original_sigint_handler = None
+    _sigint_handler_installed = False
+
+
 def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
     """Run ``spec.command`` as a subprocess with ``stdin_json`` on stdin.
 
@@ -390,11 +768,12 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
 
     Uses :class:`subprocess.Popen` + :meth:`Popen.communicate` with the
     handle registered in :data:`_live_procs` for the duration of the
-    call.  That lets an external shutdown path terminate the child
-    without waiting for the full ``spec.timeout`` to elapse inside a
-    worker thread.  For sync callers the behaviour is semantically
-    identical to the prior ``subprocess.run`` implementation (block
-    until exit or timeout, terminate+kill on timeout).
+    call.  That lets the async-pool shutdown path and SIGINT handler
+    terminate the child externally, without waiting for the full
+    ``spec.timeout`` to elapse inside a worker thread.  For sync
+    callers the behaviour is semantically identical to the prior
+    ``subprocess.run`` implementation (block until exit or timeout,
+    terminate+kill on timeout).
     """
     result: Dict[str, Any] = {
         "returncode": None,
@@ -476,8 +855,20 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
 
 
 def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]]]:
-    """Build the closure that ``invoke_hook()`` will call per firing."""
+    """Build the closure that ``invoke_hook()`` will call per firing.
 
+    Dispatches to :func:`_make_async_callback` for ``async: true``
+    specs; otherwise returns the sync callback (identical behaviour to
+    the pre-async path).
+    """
+    if spec.is_async:
+        return _make_async_callback(spec)
+    return _make_sync_callback(spec)
+
+
+def _make_sync_callback(
+    spec: ShellHookSpec,
+) -> Callable[..., Optional[Dict[str, Any]]]:
     def _callback(**kwargs: Any) -> Optional[Dict[str, Any]]:
         # Matcher gate — only meaningful for tool-scoped events.
         if spec.event in ("pre_tool_call", "post_tool_call"):
@@ -512,9 +903,85 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
                 "shell hook exited %d (event=%s command=%s); stderr=%s",
                 r["returncode"], spec.event, spec.command, stderr[:400],
             )
-        return _parse_response(spec.event, r["stdout"])
+
+        parsed = _parse_response(spec.event, r["stdout"])
+
+        # Claude-Code compatibility: warn-and-ignore if the script
+        # declared itself async at runtime.  Hermes only supports
+        # config-declared async — this keeps copy-pasted scripts from
+        # confusing hook authors.
+        try:
+            data = json.loads((r["stdout"] or "").strip() or "null")
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict) and data.get("async") is True:
+            logger.warning(
+                "shell hook requested async at runtime but Hermes only "
+                "supports config-declared async (event=%s command=%s); "
+                "runtime marker discarded.",
+                spec.event, spec.command,
+            )
+
+        return parsed
 
     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
+    _callback.__qualname__ = _callback.__name__
+    return _callback
+
+
+def _make_async_callback(spec: ShellHookSpec) -> Callable[..., None]:
+    """Build a fire-and-forget callback that submits the hook to the
+    async pool.  Returns immediately; the subprocess runs on a worker
+    thread.  Saturation drops the firing with a WARN log.
+    """
+    def _callback(**kwargs: Any) -> None:
+        if spec.event in ("pre_tool_call", "post_tool_call"):
+            if not spec.matches_tool(kwargs.get("tool_name")):
+                return None
+
+        # Early-exit if the pool is already tearing down.  Without this,
+        # a submission that slipped between shutdown-flag-set and
+        # pool.shutdown() would spawn a subprocess that misses the
+        # termination sweep and delays shutdown via shutdown(wait=True).
+        if _async_shutting_down:
+            logger.debug(
+                "async pool shutting down — dropping firing "
+                "event=%s command=%s",
+                spec.event, spec.command,
+            )
+            return None
+
+        payload = _serialize_payload(spec.event, kwargs)
+
+        # Real backpressure: pool is saturated, drop rather than queue
+        # unboundedly.  ThreadPoolExecutor's internal queue is
+        # unbounded; without this, a chatty post_tool_call could
+        # accumulate thousands of queued firings and lose most at
+        # shutdown.
+        if not _async_sem_get().acquire(blocking=False):
+            logger.warning(
+                "async shell hook pool saturated — dropping firing "
+                "event=%s command=%s",
+                spec.event, spec.command,
+            )
+            return None
+
+        try:
+            fut = _async_pool_get().submit(_run_async_body, spec, payload)
+        except RuntimeError:
+            _async_sem_get().release()
+            logger.debug(
+                "async pool shutting down — dropping firing "
+                "event=%s command=%s",
+                spec.event, spec.command,
+            )
+            return None
+
+        _register_future(fut)
+        fut.add_done_callback(_on_async_future_done)
+        return None
+
+    _callback.__name__ = f"async_shell_hook[{spec.event}:{spec.command}]"
     _callback.__qualname__ = _callback.__name__
     return _callback
 

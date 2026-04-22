@@ -8767,8 +8767,18 @@ Examples:
             )
         try:
             from hermes_cli.config import load_config
-            from agent.shell_hooks import register_from_config
+            from agent.shell_hooks import (
+                register_from_config,
+                _maybe_install_sigint_handler,
+            )
             register_from_config(load_config(), accept_hooks=_accept_hooks)
+            # Install the async-hook SIGINT handler after hook
+            # registration so Ctrl-C terminates any running hook
+            # subprocesses instead of hanging on a slow webhook.
+            # CLI-only — the gateway owns its own asyncio-native
+            # signal disposition and integrates shutdown_async_hooks
+            # into its own teardown sequence.
+            _maybe_install_sigint_handler()
         except Exception:
             logger.debug(
                 "shell-hook registration failed at CLI startup",
