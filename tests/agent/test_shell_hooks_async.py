@@ -375,6 +375,54 @@ class TestShutdownTerminatesSubprocesses:
         # well under the 10s grace window.
         assert elapsed < 3, f"shutdown took {elapsed:.2f}s (grace=10s)"
 
+    def test_shutdown_escalates_even_when_shutting_down_flag_preset(
+        self, tmp_path, stub_async_config,
+    ):
+        """Regression: the signal-handler path flips
+        ``_async_shutting_down`` *before* atexit runs
+        ``shutdown_async_hooks``.  Gating idempotency on that flag would
+        skip the SIGKILL cascade for subprocesses that ignore SIGTERM.
+        """
+        stub_async_config(pool_size=2, grace=1)
+        script = _write_script(
+            tmp_path, "trap_term.sh",
+            "#!/usr/bin/env bash\n"
+            "trap '' TERM\n"
+            "sleep 30\n",
+        )
+        spec = shell_hooks.ShellHookSpec(
+            event="post_tool_call", command=str(script),
+            timeout=60, is_async=True,
+        )
+        cb = shell_hooks._make_callback(spec)
+        cb(tool_name="terminal")
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with shell_hooks._async_tracking_lock:
+                n_procs = len(shell_hooks._live_procs)
+            if n_procs >= 1:
+                break
+            time.sleep(0.05)
+        assert n_procs >= 1
+        with shell_hooks._async_tracking_lock:
+            tracked_proc = next(iter(shell_hooks._live_procs))
+
+        # Mimic what the signal handler does before atexit fires us.
+        shell_hooks._async_shutting_down = True
+
+        t0 = time.monotonic()
+        shell_hooks.shutdown_async_hooks(grace_seconds=1)
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 5, f"shutdown took {elapsed:.2f}s"
+        # SIGTERM-ignoring subprocess must have been SIGKILLed by the
+        # escalation (rc == -SIGKILL on POSIX); the early-return bug
+        # would have left it alive.
+        assert tracked_proc.poll() is not None
+        with shell_hooks._async_tracking_lock:
+            assert len(shell_hooks._live_procs) == 0
+
 
 # ── Claude-Code runtime async marker on sync hook ────────────────────────
 

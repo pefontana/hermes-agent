@@ -59,6 +59,7 @@ import difflib
 import json
 import logging
 import os
+import platform
 import re
 import shlex
 import signal
@@ -85,6 +86,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 300
 ALLOWLIST_FILENAME = "shell-hooks-allowlist.json"
+
+# Platform guard for POSIX-only process-group APIs used in the
+# subprocess cleanup paths below.  Matches the convention in
+# ``tools/process_registry.py`` and is enforced by
+# ``tests/tools/test_windows_compat.py``.
+_IS_WINDOWS = platform.system() == "Windows"
 
 # Async-hook config clamps.  Both values are pulled live from
 # ``cli-config.yaml`` so tests and operator overrides flow through
@@ -144,7 +151,17 @@ _live_futures: Set[concurrent.futures.Future] = set()
 _async_pool_inst: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _async_sem_inst: Optional[threading.BoundedSemaphore] = None
 _async_init_lock = threading.Lock()
+# ``_async_shutting_down`` gates new work: signal handlers flip it
+# early so in-flight workers demote their exit-code log to DEBUG
+# (a signal-delivered SIGTERM/SIGKILL on the subprocess is expected,
+# not an error) and ``_spawn`` self-terminates after the ``_live_procs``
+# snapshot.  Cleanup idempotency lives on ``_async_cleanup_ran`` below
+# so that ``shutdown_async_hooks`` still runs the SIGTERM-wait-SIGKILL
+# escalation when the signal handler flipped the shutting-down flag
+# *before* the atexit hook / gateway path got to call us.
 _async_shutting_down = False
+_async_cleanup_lock = threading.Lock()
+_async_cleanup_ran = False
 _async_atexit_registered = False
 
 # Signal chaining state: only CLI-mode installs handlers (the gateway
@@ -462,13 +479,23 @@ def _unregister_live_proc(proc: subprocess.Popen) -> None:
 def _terminate_group(proc: subprocess.Popen) -> None:
     """Send SIGTERM to the subprocess's entire process group.
 
-    Hooks are spawned with ``start_new_session=True`` so the
+    On POSIX, hooks are spawned with ``start_new_session=True`` so the
     subprocess is the leader of a fresh PGID; orphaned grandchildren
     (e.g. a bash script's ``sleep``) would otherwise keep the parent
-    stdout FD open and block ``proc.communicate``.  ``killpg`` on the
-    group cascades SIGTERM to every descendant.  Falls back to a plain
-    ``terminate`` on platforms / edge cases where ``getpgid`` fails
-    (e.g. the proc already exited)."""
+    stdout FD open and block ``proc.communicate``.  Sending SIGTERM to
+    the group cascades to every descendant.  Falls back to a plain
+    ``terminate`` on edge cases where the group lookup fails (e.g. the
+    proc already exited).
+
+    On Windows the POSIX process-group APIs raise ``AttributeError``
+    (not ``OSError``) and ``start_new_session`` is silently ignored, so
+    the best we can do is single-process ``proc.terminate()``."""
+    if _IS_WINDOWS:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        return
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
     except (ProcessLookupError, OSError):
@@ -480,7 +507,15 @@ def _terminate_group(proc: subprocess.Popen) -> None:
 
 def _kill_group(proc: subprocess.Popen) -> None:
     """Same as :func:`_terminate_group` but with SIGKILL, for
-    subprocesses that didn't honor SIGTERM within the grace window."""
+    subprocesses that didn't honor SIGTERM within the grace window.
+    ``signal.SIGKILL`` does not exist on Windows — ``proc.kill()`` is
+    the platform analogue."""
+    if _IS_WINDOWS:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        return
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except (ProcessLookupError, OSError):
@@ -679,10 +714,19 @@ def shutdown_async_hooks(grace_seconds: Optional[float] = None) -> None:
     Terminates every tracked subprocess with SIGTERM, waits up to
     ``grace_seconds`` (default: config-derived) for clean exits, and
     SIGKILLs survivors.  Workers exit once their subprocess is gone.
+
+    The idempotency guard lives on ``_async_cleanup_ran`` rather than
+    ``_async_shutting_down`` so the signal-handler path still benefits
+    from the escalation: ``_async_pool_sig{int,term}_handler`` flip
+    ``_async_shutting_down`` before atexit fires us, so gating on that
+    flag would skip the SIGKILL cascade whenever a hook script ignores
+    SIGTERM.
     """
-    global _async_shutting_down
-    if _async_shutting_down:
-        return
+    global _async_shutting_down, _async_cleanup_ran
+    with _async_cleanup_lock:
+        if _async_cleanup_ran:
+            return
+        _async_cleanup_ran = True
     _async_shutting_down = True
 
     pool = _async_pool_inst
@@ -835,6 +879,7 @@ def _reset_async_pool() -> None:
     next test sees stale singletons and leaked subprocesses.
     """
     global _async_pool_inst, _async_sem_inst, _async_shutting_down
+    global _async_cleanup_ran
     global _original_sigint_handler, _original_sigterm_handler
     global _sigint_handler_installed, _sigint_handler_owned_by_us
 
@@ -851,6 +896,7 @@ def _reset_async_pool() -> None:
     _async_pool_inst = None
     _async_sem_inst = None
     _async_shutting_down = False
+    _async_cleanup_ran = False
 
     # Only restore signal handlers we actually installed ourselves —
     # tests that flip ``_sigint_handler_installed`` manually (to
