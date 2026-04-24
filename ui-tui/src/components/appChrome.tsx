@@ -156,7 +156,11 @@ export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
     return () => clearTimeout(id)
   }, [t.color.amber, tick])
 
-  return <Text color={color}>{active ? '♥' : ' '}</Text>
+  if (!active) {
+    return null
+  }
+
+  return <Text color={color}>♥</Text>
 }
 
 export function StatusRule({
@@ -187,7 +191,7 @@ export function StatusRule({
   const leftWidth = Math.max(12, cols - cwdLabel.length - 3)
 
   return (
-    <Box>
+    <Box height={1}>
       <Box flexShrink={1} width={leftWidth}>
         <Text color={t.color.bronze} wrap="truncate-end">
           {'─ '}
@@ -211,7 +215,20 @@ export function StatusRule({
             </Text>
           ) : null}
           <SpawnHud t={t} />
-          {voiceLabel ? <Text color={t.color.dim}> │ {voiceLabel}</Text> : null}
+          {voiceLabel ? (
+            <Text
+              color={
+                voiceLabel.startsWith('●')
+                  ? t.color.error
+                  : voiceLabel.startsWith('◉')
+                    ? t.color.warn
+                    : t.color.dim
+              }
+            >
+              {' │ '}
+              {voiceLabel}
+            </Text>
+          ) : null}
           {bgCount > 0 ? <Text color={t.color.dim}> │ {bgCount} bg</Text> : null}
           {showCost && typeof usage.cost_usd === 'number' ? (
             <Text color={t.color.dim}> │ ${usage.cost_usd.toFixed(4)}</Text>
@@ -245,22 +262,15 @@ export function StickyPromptTracker({ messages, offsets, scrollRef, onChange }: 
   useSyncExternalStore(
     useCallback((cb: () => void) => scrollRef.current?.subscribe(cb) ?? (() => {}), [scrollRef]),
     () => {
-      const s = scrollRef.current
+      const { atBottom, top } = getStickyViewport(scrollRef.current)
 
-      if (!s) {
-        return NaN
-      }
-
-      const top = Math.max(0, s.getScrollTop() + s.getPendingDelta())
-
-      return s.isSticky() ? -1 - top : top
+      return atBottom ? -1 - top : top
     },
     () => NaN
   )
 
-  const s = scrollRef.current
-  const top = Math.max(0, (s?.getScrollTop() ?? 0) + (s?.getPendingDelta() ?? 0))
-  const text = stickyPromptFromViewport(messages, offsets, top, s?.isSticky() ?? true)
+  const { atBottom, bottom, top } = getStickyViewport(scrollRef.current)
+  const text = stickyPromptFromViewport(messages, offsets, top, bottom, atBottom)
 
   useEffect(() => onChange(text), [onChange, text])
 
@@ -384,4 +394,16 @@ interface StickyPromptTrackerProps {
 interface TranscriptScrollbarProps {
   scrollRef: RefObject<ScrollBoxHandle | null>
   t: Theme
+}
+
+function getStickyViewport(s?: ScrollBoxHandle | null) {
+  const top = Math.max(0, (s?.getScrollTop() ?? 0) + (s?.getPendingDelta() ?? 0))
+  const vp = Math.max(0, s?.getViewportHeight() ?? 0)
+  const total = Math.max(vp, s?.getScrollHeight() ?? vp)
+
+  return {
+    atBottom: (s?.isSticky() ?? true) || top + vp >= total - 2,
+    bottom: top + vp,
+    top
+  }
 }

@@ -3,11 +3,12 @@ import { useStore } from '@nanostores/react'
 
 import type {
   ApprovalRespondResponse,
+  ConfigSetResponse,
   SecretRespondResponse,
   SudoRespondResponse,
   VoiceRecordResponse
 } from '../gatewayTypes.js'
-import { isAction, isMac } from '../lib/platform.js'
+import { isAction, isMac, isVoiceToggleKey } from '../lib/platform.js'
 
 import { getInputSelection } from './inputSelectionStore.js'
 import type { InputHandlerContext, InputHandlerResult } from './interfaces.js'
@@ -133,44 +134,42 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
   }
 
-  const voiceStop = () => {
-    voice.setRecording(false)
-    voice.setProcessing(true)
+  // CLI parity: Ctrl+B toggles the VAD-driven continuous recording loop
+  // (NOT the voice-mode umbrella bit). The mode is enabled via /voice on;
+  // Ctrl+B while the mode is off sys-nudges the user. While the mode is
+  // on, the first press starts a continuous loop (gateway → start_continuous,
+  // VAD auto-stop → transcribe → auto-restart), a subsequent press stops it.
+  // The gateway publishes voice.status + voice.transcript events that
+  // createGatewayEventHandler turns into UI badges and composer injection.
+  const voiceRecordToggle = () => {
+    if (!voice.enabled) {
+      return actions.sys('voice: mode is off — enable with /voice on')
+    }
+
+    const starting = !voice.recording
+    const action = starting ? 'start' : 'stop'
+
+    // Optimistic UI — flip the REC badge immediately so the user gets
+    // feedback while the RPC round-trips; the voice.status event is the
+    // authoritative source and may correct us.
+    if (starting) {
+      voice.setRecording(true)
+    } else {
+      voice.setRecording(false)
+      voice.setProcessing(false)
+    }
 
     gateway
-      .rpc<VoiceRecordResponse>('voice.record', { action: 'stop' })
-      .then(r => {
-        if (!r) {
-          return
+      .rpc<VoiceRecordResponse>('voice.record', { action })
+      .catch((e: Error) => {
+        // Revert optimistic UI on failure.
+        if (starting) {
+          voice.setRecording(false)
         }
 
-        const transcript = String(r.text || '').trim()
-
-        if (!transcript) {
-          return actions.sys('voice: no speech detected')
-        }
-
-        cActions.setInput(prev => (prev ? `${prev}${/\s$/.test(prev) ? '' : ' '}${transcript}` : transcript))
-      })
-      .catch((e: Error) => actions.sys(`voice error: ${e.message}`))
-      .finally(() => {
-        voice.setProcessing(false)
-        patchUiState({ status: 'ready' })
+        actions.sys(`voice error: ${e.message}`)
       })
   }
-
-  const voiceStart = () =>
-    gateway
-      .rpc<VoiceRecordResponse>('voice.record', { action: 'start' })
-      .then(r => {
-        if (!r) {
-          return
-        }
-
-        voice.setRecording(true)
-        patchUiState({ status: 'recording…' })
-      })
-      .catch((e: Error) => actions.sys(`voice error: ${e.message}`))
 
   useInput((ch, key) => {
     const live = getUiState()
@@ -369,12 +368,35 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return actions.newSession()
     }
 
-    if (isAction(key, ch, 'b')) {
-      return voice.recording ? voiceStop() : voiceStart()
+    if (isVoiceToggleKey(key, ch)) {
+      return voiceRecordToggle()
     }
 
     if (isAction(key, ch, 'g')) {
       return cActions.openEditor()
+    }
+
+    // shift-tab flips yolo without spending a turn (claude-code parity)
+    if (key.shift && key.tab && !cState.completions.length) {
+      if (!live.sid) {
+        return void actions.sys('yolo needs an active session')
+      }
+
+      // gateway.rpc swallows errors with its own sys() message and resolves to null,
+      // so we only speak when it came back with a real shape. null = rpc already spoke.
+      return void gateway.rpc<ConfigSetResponse>('config.set', { key: 'yolo', session_id: live.sid }).then(r => {
+        if (r?.value === '1') {
+          return actions.sys('yolo on')
+        }
+
+        if (r?.value === '0') {
+          return actions.sys('yolo off')
+        }
+
+        if (r) {
+          actions.sys('failed to toggle yolo')
+        }
+      })
     }
 
     if (key.tab && cState.completions.length) {
