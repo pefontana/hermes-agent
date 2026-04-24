@@ -568,3 +568,76 @@ class TestSigintTerminatesSubprocesses:
         shell_hooks._sigint_handler_installed = True
         with pytest.raises(KeyboardInterrupt):
             shell_hooks._async_pool_sigint_handler(signal.SIGINT, None)
+
+    def test_sigint_escalates_to_sigkill_when_term_is_ignored(
+        self, tmp_path, stub_async_config,
+    ):
+        """Regression: the signal handler must run the full
+        SIGTERM → grace → SIGKILL escalation inline.  Previously it
+        sent only SIGTERM and relied on atexit for the escalation —
+        but atexit runs *after* non-daemon workers exit, and a worker
+        stuck in ``proc.communicate(timeout=spec.timeout)`` waiting on
+        a TERM-ignoring subprocess delays interpreter shutdown by up
+        to 60 s even though ``grace_seconds`` is 1 s."""
+        stub_async_config(pool_size=2, grace=1)
+        sentinel = tmp_path / "handler_ready.sentinel"
+        # A Python process can truly ignore SIGTERM (bash's
+        # ``trap '' TERM`` doesn't help because bash's *external*
+        # ``sleep`` child still dies from SIGTERM independently).
+        # The sentinel closes a race window where SIGTERM arrives
+        # before the Python-level handler is installed — in that case
+        # Python's default disposition terminates the child on
+        # SIGTERM and we'd never exercise the SIGKILL path.
+        script = _write_script(
+            tmp_path, "py_ignore_term.py",
+            "#!/usr/bin/env python3\n"
+            "import os, signal, sys, time\n"
+            "signal.signal(signal.SIGTERM, lambda *a: None)\n"
+            f"open({str(sentinel)!r}, 'w').close()\n"
+            "sys.stdin.read()\n"
+            "end = time.monotonic() + 120\n"
+            "while time.monotonic() < end:\n"
+            "    try: time.sleep(1)\n"
+            "    except InterruptedError: pass\n",
+        )
+        spec = shell_hooks.ShellHookSpec(
+            event="post_tool_call", command=str(script),
+            timeout=60, is_async=True,
+        )
+        cb = shell_hooks._make_callback(spec)
+        cb(tool_name="terminal")
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with shell_hooks._async_tracking_lock:
+                n_procs = len(shell_hooks._live_procs)
+            if n_procs >= 1 and sentinel.exists():
+                break
+            time.sleep(0.05)
+        assert n_procs >= 1
+        assert sentinel.exists(), "child never installed SIGTERM handler"
+        with shell_hooks._async_tracking_lock:
+            tracked_proc = next(iter(shell_hooks._live_procs))
+
+        previous_received: list[int] = []
+        shell_hooks._original_sigint_handler = (
+            lambda sig, frm: previous_received.append(sig)
+        )
+        shell_hooks._sigint_handler_installed = True
+
+        t0 = time.monotonic()
+        shell_hooks._async_pool_sigint_handler(signal.SIGINT, None)
+        elapsed = time.monotonic() - t0
+
+        assert previous_received == [signal.SIGINT]
+        # Before the fix this took ~spec.timeout (60 s) because the
+        # escalation happened only in atexit, which waited for the
+        # worker thread to unblock first.  After the fix the handler
+        # runs the escalation inline and comes back within a small
+        # multiple of ``grace_seconds`` (1 s in this test).
+        assert elapsed < 5, f"handler took {elapsed:.2f}s (grace=1s)"
+        # TERM-ignoring Python subprocess can only die via SIGKILL.
+        assert tracked_proc.poll() is not None
+        assert tracked_proc.returncode == -signal.SIGKILL, (
+            f"expected -SIGKILL rc, got {tracked_proc.returncode}"
+        )

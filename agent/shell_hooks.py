@@ -766,25 +766,33 @@ def shutdown_async_hooks(grace_seconds: Optional[float] = None) -> None:
 
 
 def _async_pool_sigint_handler(signum, frame):
-    """CLI-mode SIGINT handler: terminate tracked subprocesses without
-    waiting the shutdown-grace window, then chain to the original
-    handler so ``KeyboardInterrupt`` propagation still happens.
+    """CLI-mode SIGINT handler: run the full async-hook shutdown
+    inline (SIGTERM → wait grace_seconds → SIGKILL survivors), then
+    chain to the original handler so ``KeyboardInterrupt`` propagation
+    still happens.
+
+    Inline shutdown — rather than the previous SIGTERM-only cascade
+    that relied on atexit for the SIGKILL escalation — is required
+    because ``ThreadPoolExecutor`` uses non-daemon threads: the
+    interpreter waits for every worker to return *before* running
+    atexit, and workers block in ``proc.communicate(timeout=spec.timeout)``
+    until the subprocess dies.  A hook script that ignores SIGTERM
+    would therefore delay Ctrl-C by ``spec.timeout`` (60 s default,
+    300 s max) instead of the intended ``grace_seconds``.  Running
+    ``shutdown_async_hooks`` here drops that to ``grace_seconds``.
 
     Installed only by CLI-mode callers (see
     ``_maybe_install_signal_handlers``); the gateway integrates
     ``shutdown_async_hooks`` into its asyncio shutdown sequence
     instead.
     """
-    global _async_shutting_down
-    # Flip the flag so workers whose subprocesses we're about to
-    # SIGTERM log at DEBUG rather than WARN (the negative exit code
-    # is expected on a Ctrl-C).
-    _async_shutting_down = True
-
-    with _async_tracking_lock:
-        procs = list(_live_procs)
-    for proc in procs:
-        _terminate_group(proc)
+    try:
+        shutdown_async_hooks()
+    except Exception:
+        # Signal handlers must never raise out of cleanup — the chain
+        # / KeyboardInterrupt logic below is what the user actually
+        # expects to see.
+        pass
 
     handler = _original_sigint_handler
     if handler in (signal.SIG_DFL, signal.SIG_IGN, None):
@@ -793,38 +801,32 @@ def _async_pool_sigint_handler(signum, frame):
 
 
 def _async_pool_sigterm_handler(signum, frame):
-    """CLI-mode SIGTERM handler: terminate tracked subprocesses
-    *inline* so their worker threads unblock, then ``sys.exit`` so
-    Python still runs the atexit chain.
+    """CLI-mode SIGTERM handler: run the full async-hook shutdown
+    inline (SIGTERM → wait grace_seconds → SIGKILL survivors), then
+    ``sys.exit`` so Python still runs the atexit chain.
 
-    Without the inline terminate, atexit would not fire for the life
-    of every in-flight hook: the ``ThreadPoolExecutor`` uses
-    non-daemon threads, so Python waits for every worker to return
-    before running atexit.  Workers block inside
-    ``proc.communicate(timeout=spec.timeout)`` until the subprocess
-    exits — up to 300 seconds for a slow webhook — which defeats the
-    whole point of SIGTERM-as-graceful-shutdown.
+    Same reasoning as :func:`_async_pool_sigint_handler` applies: the
+    ``ThreadPoolExecutor`` uses non-daemon threads, so the interpreter
+    waits for every worker to return before atexit runs.  Unless we
+    escalate to SIGKILL here, a TERM-ignoring hook script blocks the
+    interpreter for ``spec.timeout`` (60 s default, 300 s max) because
+    its worker is stuck in ``proc.communicate``.
 
     Chains to the previous SIGTERM handler if one was installed.
     Gateways install their own SIGTERM handler on the asyncio loop,
     so this path is CLI-only.
     """
-    global _async_shutting_down
-    # Same flag-flip as the SIGINT handler: demote the workers'
-    # exit-code logs to DEBUG during a signal-initiated shutdown.
-    _async_shutting_down = True
-
-    with _async_tracking_lock:
-        procs = list(_live_procs)
-    for proc in procs:
-        _terminate_group(proc)
+    try:
+        shutdown_async_hooks()
+    except Exception:
+        pass
 
     handler = _original_sigterm_handler
     if handler not in (signal.SIG_DFL, signal.SIG_IGN, None):
         handler(signum, frame)
-    # SystemExit runs the atexit chain, which includes
-    # shutdown_async_hooks().  128 + signal number matches shell
-    # convention for signal-initiated exits.
+    # SystemExit runs the atexit chain, which sees
+    # ``_async_cleanup_ran=True`` and no-ops.  128 + signal number
+    # matches shell convention for signal-initiated exits.
     sys.exit(128 + signal.SIGTERM)
 
 
